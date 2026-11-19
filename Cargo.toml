@@ -1,6 +1,6 @@
 [package]
 name = "rustarc"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "A small WinRAR-style archive manager for Linux (7z + RAR)"
 

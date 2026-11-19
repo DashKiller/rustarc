@@ -994,14 +994,16 @@ impl eframe::App for App {
             // Optional columns fit their content; Name takes all remaining width so the table
             // always spans the window. If even that is too narrow, the table scrolls sideways.
             let avail_w = ui.available_width();
-            let gap = ui.spacing().item_spacing.x;
             let font = egui::TextStyle::Body.resolve(ui.style());
             let ink = ui.visuals().text_color();
             let measure = |ui: &egui::Ui, s: &str| -> f32 {
                 ui.painter().layout_no_wrap(s.to_string(), font.clone(), ink).size().x
             };
+            // egui's automatic spacing between columns is turned off inside the table, so the
+            // widths below are the whole story: every column gets padding on its right
+            // (20 px between columns, 8 px after the last, like Name's 8 px on the left).
+            let last_col = (0..NCOLS).rev().find(|&k| vis[k]);
             let mut widths = [0.0f32; NCOLS];
-            let mut ncols = 1usize;
             let mut used = 0.0f32;
             for k in 0..NCOLS {
                 if vis[k] {
@@ -1009,15 +1011,20 @@ impl eframe::App for App {
                     for s in &self.col_samples[k] {
                         w = w.max(measure(ui, s));
                     }
-                    widths[k] = w + 16.0;
+                    widths[k] = (w + if Some(k) == last_col { 8.0 } else { 20.0 }).ceil();
                     used += widths[k];
-                    ncols += 1;
                 }
             }
-            let name_w = (avail_w - used - gap * (ncols as f32 - 1.0) - 2.0).max(200.0);
+            const NAME_MIN: f32 = 120.0;
+            // Whole pixels, rounded down: the table never exceeds the window, and there is no
+            // visible gap on the right.
+            let name_w = (avail_w - used).floor().max(NAME_MIN);
+            // Only allow horizontal scrolling when the columns genuinely cannot fit.
+            let needs_h_scroll = used + NAME_MIN > avail_w + 0.5;
 
             ui.push_id(self.table_gen, |ui| {
-            egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            egui::ScrollArea::new([needs_h_scroll, false]).auto_shrink([false, false]).show(ui, |ui| {
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .sense(Sense::click_and_drag())
@@ -1045,7 +1052,6 @@ impl eframe::App for App {
                                     ui.add_space(8.0);
                                 }
                                 ui.label(*t);
-                                ui.add_space(6.0);
                             });
                         });
                     }
@@ -1092,7 +1098,6 @@ impl eframe::App for App {
                                     if let Some(t) = text {
                                         ui.add(egui::Label::new(t).selectable(false));
                                     }
-                                    ui.add_space(6.0);
                                 });
                             });
                         }
