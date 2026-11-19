@@ -237,6 +237,8 @@ pub struct App {
     col_prefs: HashMap<String, [bool; NCOLS]>,
     cols_key: String,
     table_gen: u64,
+    /// Longest cell texts per optional column, used to size the columns.
+    col_samples: Vec<Vec<String>>,
     expanded: HashSet<String>,
     selected: HashSet<String>,
     last_clicked: Option<String>,
@@ -280,6 +282,7 @@ impl App {
             col_prefs: HashMap::new(),
             cols_key: String::new(),
             table_gen: 0,
+            col_samples: vec![Vec::new(); NCOLS],
             expanded: HashSet::new(),
             selected: HashSet::new(),
             last_clicked: None,
@@ -352,6 +355,16 @@ impl App {
                     match res {
                         Ok((fmt, entries)) => {
                             self.tree = build_tree(&entries);
+                            self.col_samples = (0..NCOLS)
+                                .map(|k| {
+                                    let mut v: Vec<String> =
+                                        self.tree.nodes.iter().filter_map(|n| cell_text(n, k)).collect();
+                                    v.sort_by_key(|s| std::cmp::Reverse(s.chars().count()));
+                                    v.dedup();
+                                    v.truncate(3);
+                                    v
+                                })
+                                .collect();
                             self.expanded.clear(); // folders start collapsed
                             self.status = format!("{} archive", fmt.label());
                             let key = cols_key(fmt);
@@ -574,6 +587,69 @@ impl App {
 
 // ───────────────────────────── widgets ────────────────────────────────
 
+/// Text shown in optional column `k` for a node.
+fn cell_text(n: &Node, k: usize) -> Option<String> {
+    match k {
+        0 => Some(human(n.size)),
+        1 => n.packed.map(human),
+        2 => n.mode.clone(),
+        3 => n.owner.clone(),
+        4 => n.group.clone(),
+        5 => match n.packed {
+            Some(p) if n.size > 0 && !n.is_dir => {
+                let saved = (1.0 - p as f64 / n.size as f64) * 100.0;
+                Some(format!("{:.0} %", saved.max(0.0)))
+            }
+            _ => None,
+        },
+        6 => n.crc.map(|c| format!("{c:08X}")),
+        7 => n.method.clone(),
+        8 => n.version.clone(),
+        _ => n.date.clone(),
+    }
+}
+
+/// Find the Noto Sans regular font: bundled in the AppImage, via fontconfig, or common paths.
+fn find_noto_sans() -> Option<Vec<u8>> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("APPDIR") {
+        paths.push(PathBuf::from(dir).join("usr/share/fonts/NotoSans-Regular.ttf"));
+    }
+    if let Ok(out) = std::process::Command::new("fc-match")
+        .args(["-f", "%{family}|%{file}", "Noto Sans"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        if let Some((fam, file)) = s.split_once('|') {
+            // fc-match falls back to other fonts, so only accept an exact "Noto Sans"
+            if fam.split(',').next().map(str::trim) == Some("Noto Sans") {
+                paths.push(PathBuf::from(file.trim()));
+            }
+        }
+    }
+    for p in [
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/TTF/NotoSans-Regular.ttf",
+    ] {
+        paths.push(PathBuf::from(p));
+    }
+    paths.into_iter().find_map(|p| std::fs::read(p).ok())
+}
+
+fn install_font(ctx: &egui::Context, bytes: Vec<u8>) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("NotoSans".to_owned(), egui::FontData::from_owned(bytes));
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "NotoSans".to_owned()); // egui's built-in fonts stay as fallback
+    ctx.set_fonts(fonts);
+}
+
 fn human(n: u64) -> String {
     const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let (mut v, mut i) = (n as f64, 0);
@@ -669,6 +745,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.styled {
             ctx.set_visuals(ark_visuals());
+            if let Some(bytes) = find_noto_sans() {
+                install_font(ctx, bytes);
+            }
             self.styled = true;
         }
         if let Some(p) = self.startup.take() {
@@ -912,16 +991,41 @@ impl eframe::App for App {
             let vis = self.show_cols;
             let mut new_cols = vis;
 
+            // Optional columns fit their content; Name takes all remaining width so the table
+            // always spans the window. If even that is too narrow, the table scrolls sideways.
+            let avail_w = ui.available_width();
+            let gap = ui.spacing().item_spacing.x;
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let ink = ui.visuals().text_color();
+            let measure = |ui: &egui::Ui, s: &str| -> f32 {
+                ui.painter().layout_no_wrap(s.to_string(), font.clone(), ink).size().x
+            };
+            let mut widths = [0.0f32; NCOLS];
+            let mut ncols = 1usize;
+            let mut used = 0.0f32;
+            for k in 0..NCOLS {
+                if vis[k] {
+                    let mut w = measure(ui, COL_NAMES[k]);
+                    for s in &self.col_samples[k] {
+                        w = w.max(measure(ui, s));
+                    }
+                    widths[k] = w + 16.0;
+                    used += widths[k];
+                    ncols += 1;
+                }
+            }
+            let name_w = (avail_w - used - gap * (ncols as f32 - 1.0) - 2.0).max(200.0);
+
             ui.push_id(self.table_gen, |ui| {
+            egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
             let mut table = TableBuilder::new(ui)
                 .striped(true)
-                .resizable(true)
                 .sense(Sense::click_and_drag())
-                .column(Column::remainder().at_least(200.0).clip(true));
+                .column(Column::exact(name_w).clip(true));
             let mut headers: Vec<&str> = vec!["Name"];
             for k in 0..NCOLS {
                 if vis[k] {
-                    table = table.column(Column::auto());
+                    table = table.column(Column::exact(widths[k]));
                     headers.push(COL_NAMES[k]);
                 }
             }
@@ -984,24 +1088,7 @@ impl eframe::App for App {
                             }
                             row.col(|ui| {
                                 ui.horizontal_centered(|ui| {
-                                    let text: Option<String> = match k {
-                                        0 => Some(human(n.size)),
-                                        1 => n.packed.map(human),
-                                        2 => n.mode.clone(),
-                                        3 => n.owner.clone(),
-                                        4 => n.group.clone(),
-                                        5 => match n.packed {
-                                            Some(p) if n.size > 0 && !n.is_dir => {
-                                                let saved = (1.0 - p as f64 / n.size as f64) * 100.0;
-                                                Some(format!("{:.0} %", saved.max(0.0)))
-                                            }
-                                            _ => None,
-                                        },
-                                        6 => n.crc.map(|c| format!("{c:08X}")),
-                                        7 => n.method.clone(),
-                                        8 => n.version.clone(),
-                                        _ => n.date.clone(),
-                                    };
+                                    let text = cell_text(n, k);
                                     if let Some(t) = text {
                                         ui.add(egui::Label::new(t).selectable(false));
                                     }
@@ -1020,6 +1107,7 @@ impl eframe::App for App {
                         }
                     });
                 });
+            });
             });
             if new_cols != self.show_cols {
                 self.table_gen += 1;

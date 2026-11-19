@@ -22,6 +22,17 @@ cp packaging/rustarc.svg "$APPDIR/rustarc.svg"
 cp packaging/rustarc.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/"
 chmod +x "$APPDIR/AppRun"
 
+# Bundle Noto Sans (the UI font) if it is installed here; the app falls back to egui's
+# built-in font when it can't find it.
+mkdir -p "$APPDIR/usr/share/fonts"
+FONT="$(fc-match -f '%{family}|%{file}' 'Noto Sans' 2>/dev/null || true)"
+FAMILY="${FONT%%|*}"; FAMILY="${FAMILY%%,*}"
+if [ "$FAMILY" = "Noto Sans" ] && [ -f "${FONT#*|}" ]; then
+  cp "${FONT#*|}" "$APPDIR/usr/share/fonts/NotoSans-Regular.ttf"
+else
+  echo "warning: Noto Sans not found on this system, not bundling it (install fonts-noto-core / noto-fonts)"
+fi
+
 TOOL=build/appimagetool
 if [ ! -x "$TOOL" ]; then
   mkdir -p build
