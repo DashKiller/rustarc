@@ -1169,7 +1169,7 @@ impl eframe::App for App {
                 if self.busy {
                     ui.spinner();
                 }
-                ui.label(&self.status);
+                ui.add(egui::Label::new(self.status.as_str()).selectable(false));
                 if self.path.is_some() {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let sel = if self.selected.is_empty() {
@@ -1177,10 +1177,13 @@ impl eframe::App for App {
                         } else {
                             format!("{} selected   ", self.selected.len())
                         };
-                        ui.label(format!(
-                            "{sel}{folders} folder(s), {files} file(s), {}",
-                            human(total)
-                        ));
+                        ui.add(
+                            egui::Label::new(format!(
+                                "{sel}{folders} folder(s), {files} file(s), {}",
+                                human(total)
+                            ))
+                            .selectable(false),
+                        );
                     });
                 }
             });
@@ -1286,7 +1289,7 @@ impl eframe::App for App {
                             });
                             ui.horizontal_centered(|ui| {
                                 ui.add_space(8.0);
-                                ui.label(*t);
+                                ui.add(egui::Label::new(*t).selectable(false));
                             });
                             let rect = ui.max_rect();
                             let stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(62, 68, 74));
