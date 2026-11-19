@@ -864,7 +864,7 @@ fn ark_visuals() -> egui::Visuals {
     v.panel_fill = panel;
     v.window_fill = panel;
     v.extreme_bg_color = base;
-    v.faint_bg_color = panel;
+    v.faint_bg_color = Color32::from_rgb(26, 29, 31);
     v.window_stroke = Stroke::new(1.0_f32, line);
     v.hyperlink_color = accent;
     v.selection.bg_fill = accent;
@@ -1188,7 +1188,7 @@ impl eframe::App for App {
 
         // ── file tree ──
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::from_rgb(35, 38, 41)))
+            .frame(egui::Frame::none().fill(Color32::from_rgb(20, 22, 24)))
             .show(ctx, |ui| {
             if self.path.is_none() {
                 ui.centered_and_justified(|ui| {
@@ -1236,8 +1236,8 @@ impl eframe::App for App {
                 ui.painter().layout_no_wrap(s.to_string(), font.clone(), ink).size().x
             };
             // egui's automatic spacing between columns is turned off inside the table, so the
-            // widths below are the whole story: every column gets padding on its right
-            // (20 px between columns, 8 px after the last, like Name's 8 px on the left).
+            // widths below are the whole story: every column gets 8 px of padding on its left
+            // (like Name) and 12 px on its right (8 px for the last column).
             let last_col = (0..NCOLS).rev().find(|&k| vis[k]);
             let mut widths = [0.0f32; NCOLS];
             let mut used = 0.0f32;
@@ -1247,7 +1247,7 @@ impl eframe::App for App {
                     for s in &self.col_samples[k] {
                         w = w.max(measure(ui, s));
                     }
-                    widths[k] = (w + if Some(k) == last_col { 8.0 } else { 20.0 }).ceil();
+                    widths[k] = (w + 8.0 + if Some(k) == last_col { 8.0 } else { 12.0 }).ceil();
                     used += widths[k];
                 }
             }
@@ -1260,6 +1260,7 @@ impl eframe::App for App {
 
             ui.push_id(self.table_gen, |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
+            ui.spacing_mut().item_spacing.y = 0.0;
             egui::ScrollArea::new([needs_h_scroll, false]).auto_shrink([false, false]).show(ui, |ui| {
             let mut table = TableBuilder::new(ui)
                 .striped(true)
@@ -1284,16 +1285,21 @@ impl eframe::App for App {
                                 }
                             });
                             ui.horizontal_centered(|ui| {
-                                if i == 0 {
-                                    ui.add_space(8.0);
-                                }
+                                ui.add_space(8.0);
                                 ui.label(*t);
                             });
+                            let rect = ui.max_rect();
+                            let stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(62, 68, 74));
+                            let p = ui.painter();
+                            p.hline(rect.x_range(), rect.bottom() - 0.5, stroke);
+                            if i + 1 < headers.len() {
+                                p.vline(rect.right() - 0.5, rect.y_range(), stroke);
+                            }
                         });
                     }
                 })
                 .body(|body| {
-                    body.rows(26.0, rows.len(), |mut row| {
+                    body.rows(29.0, rows.len(), |mut row| {
                         let (ni, depth) = rows[row.index()];
                         let n = &self.tree.nodes[ni];
                         row.set_selected(self.selected.contains(&n.full));
@@ -1330,6 +1336,7 @@ impl eframe::App for App {
                             }
                             row.col(|ui| {
                                 ui.horizontal_centered(|ui| {
+                                    ui.add_space(8.0);
                                     let text = cell_text(n, k);
                                     if let Some(t) = text {
                                         ui.add(egui::Label::new(t).selectable(false));
