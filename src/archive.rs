@@ -908,12 +908,232 @@ pub fn normalize_dest(p: PathBuf) -> PathBuf {
 }
 
 pub fn create(sources: &[PathBuf], dest: &Path, progress: Progress) -> Result<String, String> {
-    match kind_from_name(dest).ok_or("Unknown output format (use .7z, .zip, .tar.gz, …)")? {
-        Kind::SevenZ => create_7z(sources, dest, progress)?,
-        Kind::Zip => create_zip(sources, dest, progress)?,
-        Kind::Tar(comp) => create_tar(sources, dest, comp, progress)?,
-    }
+    let kind = kind_from_name(dest).ok_or("Unknown output format (use .7z, .zip, .tar.gz, …)")?;
+    create_kind(kind, sources, dest, progress)?;
     Ok(format!("Created {}", dest.display()))
+}
+
+fn create_kind(kind: Kind, sources: &[PathBuf], dest: &Path, progress: Progress) -> Result<(), String> {
+    match kind {
+        Kind::SevenZ => create_7z(sources, dest, progress),
+        Kind::Zip => create_zip(sources, dest, progress),
+        Kind::Tar(comp) => create_tar(sources, dest, comp, progress),
+    }
+}
+
+// ───────────────────────── adding to an existing archive ─────────────────────────
+
+fn kind_of(fmt: Format) -> Option<Kind> {
+    match fmt {
+        Format::SevenZ => Some(Kind::SevenZ),
+        Format::Zip => Some(Kind::Zip),
+        Format::Tar(c) => Some(Kind::Tar(c)),
+        Format::Rar | Format::Single(_) => None,
+    }
+}
+
+/// Can files be added to archives of this format? (RAR cannot be written.)
+pub fn can_add(fmt: Format) -> bool {
+    kind_of(fmt).is_some()
+}
+
+fn copy_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    if src.is_dir() {
+        fs::create_dir_all(dst)?;
+        for e in fs::read_dir(src)? {
+            let e = e?;
+            copy_recursive(&e.path(), &dst.join(e.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Rewrite an archive through a work folder: unpack, let `edit` change the files, pack into a
+/// temporary file, then swap it in. The original is only replaced after a successful write.
+fn rewrite_with<F>(
+    archive: &Path,
+    kind: Kind,
+    password: &str,
+    progress: Progress,
+    edit: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    let fname = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or("Invalid archive path")?;
+    let work = archive.with_file_name(format!(".{fname}.rustarc-work"));
+    let tmp = archive.with_file_name(format!(".{fname}.rustarc-tmp"));
+    let _ = fs::remove_dir_all(&work);
+    let _ = fs::remove_file(&tmp);
+
+    let result = (|| -> Result<(), String> {
+        fs::create_dir_all(&work).map_err(es)?;
+        extract(archive, &work, None, password, progress)?;
+        edit(&work)?;
+
+        let mut top: Vec<PathBuf> = fs::read_dir(&work)
+            .map_err(es)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect();
+        top.sort();
+        progress("Writing archive…".to_string());
+        create_kind(kind, &top, &tmp, progress)?;
+        fs::rename(&tmp, archive).map_err(es)
+    })();
+
+    let _ = fs::remove_dir_all(&work);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn password_note(password: &str) -> &'static str {
+    if password.is_empty() {
+        ""
+    } else {
+        " (password protection was not kept)"
+    }
+}
+
+/// Add files/folders to an archive, optionally inside the folder `into` ("" = top level).
+/// Items with the same name as existing ones replace them.
+///  * ZIP: appended in place when nothing clashes.
+///  * 7z / TAR*: rewritten through a work folder (see `rewrite_with`).
+pub fn add_files(
+    archive: &Path,
+    sources: &[PathBuf],
+    into: &str,
+    password: &str,
+    progress: Progress,
+) -> Result<String, String> {
+    let fmt = Format::detect(archive).ok_or("Unsupported archive format")?;
+    let kind = kind_of(fmt).ok_or("Adding files is not supported for this archive type")?;
+    let into = into.trim_matches('/').to_string();
+
+    if kind == Kind::Zip && try_zip_append(archive, sources, &into, progress)? {
+        return Ok(format!("Added {} item(s)", sources.len()));
+    }
+
+    rewrite_with(archive, kind, password, progress, |work| {
+        let target = if into.is_empty() {
+            work.to_path_buf()
+        } else {
+            safe_join(work, &into).ok_or("Invalid target folder")?
+        };
+        fs::create_dir_all(&target).map_err(es)?;
+        for src in sources {
+            let name = src_name(src)?;
+            progress(format!("Adding {name}"));
+            copy_recursive(src, &target.join(&name)).map_err(es)?;
+        }
+        Ok(())
+    })?;
+    Ok(format!("Added {} item(s){}", sources.len(), password_note(password)))
+}
+
+/// Remove the selected files/folders (a selected folder takes its contents with it).
+///  * ZIP: surviving entries are copied as-is into a new file (no recompression).
+///  * 7z / TAR*: rewritten through a work folder.
+pub fn remove_items(
+    archive: &Path,
+    remove: &HashSet<String>,
+    password: &str,
+    progress: Progress,
+) -> Result<String, String> {
+    let fmt = Format::detect(archive).ok_or("Unsupported archive format")?;
+    let kind = kind_of(fmt).ok_or("Removing files is not supported for this archive type")?;
+
+    if kind == Kind::Zip {
+        remove_zip(archive, remove, progress)?;
+        return Ok(format!("Removed {} item(s)", remove.len()));
+    }
+
+    rewrite_with(archive, kind, password, progress, |work| {
+        for item in remove {
+            let Some(path) = safe_join(work, item) else { continue };
+            progress(format!("Removing {item}"));
+            if path.is_dir() {
+                fs::remove_dir_all(&path).map_err(es)?;
+            } else if path.exists() {
+                fs::remove_file(&path).map_err(es)?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(format!("Removed {} item(s){}", remove.len(), password_note(password)))
+}
+
+fn remove_zip(archive: &Path, remove: &HashSet<String>, progress: Progress) -> Result<(), String> {
+    let fname = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or("Invalid archive path")?;
+    let tmp = archive.with_file_name(format!(".{fname}.rustarc-tmp"));
+    let _ = fs::remove_file(&tmp);
+
+    let result = (|| -> Result<(), String> {
+        let mut old = zip::ZipArchive::new(File::open(archive).map_err(es)?).map_err(es)?;
+        let mut w = zip::ZipWriter::new(File::create(&tmp).map_err(es)?);
+        for i in 0..old.len() {
+            let f = old.by_index_raw(i).map_err(es)?;
+            let name = norm(f.name());
+            if wanted(&name, Some(remove)) {
+                progress(format!("Removing {name}"));
+                continue;
+            }
+            w.raw_copy_file(f).map_err(es)?;
+        }
+        w.finish().map_err(es)?;
+        fs::rename(&tmp, archive).map_err(es)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Append to a ZIP without rewriting it. Returns Ok(false) if a name already exists
+/// (the caller then rewrites the archive so the new items replace the old ones).
+fn try_zip_append(
+    archive: &Path,
+    sources: &[PathBuf],
+    into: &str,
+    progress: Progress,
+) -> Result<bool, String> {
+    let existing: HashSet<String> = list_zip(archive)?
+        .into_iter()
+        .map(|e| e.name.trim_end_matches('/').to_string())
+        .collect();
+    let prefix = if into.is_empty() { String::new() } else { format!("{into}/") };
+    let mut names = Vec::new();
+    for s in sources {
+        let n = format!("{prefix}{}", src_name(s)?);
+        if existing.contains(&n) {
+            return Ok(false);
+        }
+        names.push(n);
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(archive)
+        .map_err(es)?;
+    let mut w = zip::ZipWriter::new_append(file).map_err(es)?;
+    for (s, n) in sources.iter().zip(names) {
+        add_zip(&mut w, s, n, progress)?;
+    }
+    w.finish().map_err(es)?;
+    Ok(true)
 }
 
 fn src_name(src: &Path) -> Result<String, String> {

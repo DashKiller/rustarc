@@ -249,6 +249,7 @@ pub struct App {
     show_password: bool,
     pw_retry: Option<PathBuf>,
     preview: Option<(String, String)>,
+    confirm_remove: Option<Vec<String>>,
     status: String,
     busy: bool,
     pending_open: Option<PathBuf>,
@@ -293,6 +294,7 @@ impl App {
             show_password: false,
             pw_retry: None,
             preview: None,
+            confirm_remove: None,
             status: "Open an archive (or drop one here).".into(),
             busy: false,
             pending_open: None,
@@ -554,6 +556,62 @@ impl App {
         });
     }
 
+    /// Selected items without those already covered by a selected parent folder.
+    fn top_level_selection(&self) -> Vec<String> {
+        self.selected
+            .iter()
+            .filter(|p| {
+                !self
+                    .selected
+                    .iter()
+                    .any(|q| q.as_str() != p.as_str() && p.starts_with(&format!("{q}/")))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn remove_selected(&mut self, ctx: &egui::Context, items: Vec<String>) {
+        let Some(path) = self.path.clone() else { return };
+        if items.is_empty() {
+            return;
+        }
+        let sel: HashSet<String> = items.into_iter().collect();
+        let pw = self.password.clone();
+        self.pending_open = Some(path.clone());
+        self.run(ctx, "Removing…", move |p| archive::remove_items(&path, &sel, &pw, p));
+    }
+
+    /// Add files (or folders) to the open archive; goes into the selected folder if exactly
+    /// one folder is selected, otherwise to the top level.
+    fn add_files(&mut self, ctx: &egui::Context, folders: bool) {
+        let Some(path) = self.path.clone() else { return };
+        if !self.format.map(archive::can_add).unwrap_or(false) {
+            return;
+        }
+        let dialog = rfd::FileDialog::new().set_title("Add to archive");
+        let sources: Vec<PathBuf> = if folders {
+            dialog.pick_folders().unwrap_or_default()
+        } else {
+            dialog.pick_files().unwrap_or_default()
+        };
+        if sources.is_empty() {
+            return;
+        }
+        let into = if self.selected.len() == 1 {
+            self.tree
+                .nodes
+                .iter()
+                .find(|n| n.is_dir && self.selected.contains(&n.full))
+                .map(|n| n.full.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let pw = self.password.clone();
+        self.pending_open = Some(path.clone());
+        self.run(ctx, "Adding files…", move |p| archive::add_files(&path, &sources, &into, &pw, p));
+    }
+
     fn create_archive(&mut self, ctx: &egui::Context, folders: bool) {
         let dialog = rfd::FileDialog::new().set_title("Choose what to add");
         let sources: Vec<PathBuf> = if folders {
@@ -788,6 +846,7 @@ impl eframe::App for App {
 
         let has = self.path.is_some() && !self.busy;
         let has_file_sel = has && !self.selected_files().is_empty();
+        let can_add = has && self.format.map(archive::can_add).unwrap_or(false);
 
         // ── toolbar ──
         egui::TopBottomPanel::top("toolbar")
@@ -821,8 +880,13 @@ impl eframe::App for App {
                         );
                     });
 
-                    tool_button(ui, Icon::Add, "Add Files", false)
-                        .on_hover_text("Modifying existing archives is not supported yet");
+                    let r = tool_button(ui, Icon::Add, "Add Files", can_add);
+                    if r.clicked() {
+                        self.add_files(ctx, false);
+                    }
+                    if !can_add {
+                        r.on_hover_text("Adding files is not supported for this archive type (e.g. RAR)");
+                    }
 
                     if tool_button(ui, Icon::Find, "Find", true).clicked() {
                         self.show_find = !self.show_find;
@@ -837,8 +901,18 @@ impl eframe::App for App {
                     if tool_button(ui, Icon::Open, "Open in External Application", has_file_sel).clicked() {
                         self.open_external(ctx);
                     }
-                    tool_button(ui, Icon::Remove, "Remove from Archive", false)
-                        .on_hover_text("Modifying existing archives is not supported yet");
+                    let can_remove = can_add && !self.selected.is_empty();
+                    let r = tool_button(ui, Icon::Remove, "Remove from Archive", can_remove);
+                    if r.clicked() {
+                        self.confirm_remove = Some(self.top_level_selection());
+                    }
+                    if !can_remove {
+                        r.on_hover_text(if can_add {
+                            "Select the items to remove first"
+                        } else {
+                            "Removing is not supported for this archive type (e.g. RAR)"
+                        });
+                    }
 
                     // Hamburger menu on the right
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -854,6 +928,22 @@ impl eframe::App for App {
                             if ui.add_enabled(!self.busy, egui::Button::new("New archive from folders…")).clicked() {
                                 ui.close_menu();
                                 self.create_archive(ctx, true);
+                            }
+                            ui.separator();
+                            if ui.add_enabled(can_add, egui::Button::new("Add files…")).clicked() {
+                                ui.close_menu();
+                                self.add_files(ctx, false);
+                            }
+                            if ui.add_enabled(can_add, egui::Button::new("Add folder…")).clicked() {
+                                ui.close_menu();
+                                self.add_files(ctx, true);
+                            }
+                            if ui
+                                .add_enabled(can_add && !self.selected.is_empty(), egui::Button::new("Remove from archive…"))
+                                .clicked()
+                            {
+                                ui.close_menu();
+                                self.confirm_remove = Some(self.top_level_selection());
                             }
                             ui.separator();
                             if ui.add_enabled(has, egui::Button::new("Extract all…")).clicked() {
@@ -1210,6 +1300,35 @@ impl eframe::App for App {
             } else {
                 self.show_password = open;
             }
+        }
+
+        // ── confirm removal ──
+        let mut do_remove: Option<Vec<String>> = None;
+        let mut cancel_remove = false;
+        if let Some(items) = &self.confirm_remove {
+            egui::Window::new("Remove from archive")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("Remove {} selected item(s) from the archive?", items.len()));
+                    ui.label("The archive will be rewritten. This cannot be undone.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Remove").clicked() {
+                            do_remove = Some(items.clone());
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_remove = true;
+                        }
+                    });
+                });
+        }
+        if let Some(items) = do_remove {
+            self.confirm_remove = None;
+            self.remove_selected(ctx, items);
+        } else if cancel_remove {
+            self.confirm_remove = None;
         }
 
         // ── preview window ──
