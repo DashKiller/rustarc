@@ -866,6 +866,15 @@ fn ark_visuals() -> egui::Visuals {
     v.extreme_bg_color = base;
     v.faint_bg_color = Color32::from_rgb(26, 29, 31);
     v.window_stroke = Stroke::new(1.0_f32, line);
+    // Shadow for dialogs and right-click menus: centred behind the window (no offset).
+    let shadow = egui::epaint::Shadow {
+        offset: Vec2::ZERO,
+        blur: 16.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(95),
+    };
+    v.window_shadow = shadow;
+    v.popup_shadow = shadow;
     v.hyperlink_color = accent;
     v.selection.bg_fill = accent;
     v.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
@@ -983,8 +992,19 @@ impl eframe::App for App {
         }
 
         // ── toolbar ──
+        // Toolbar colour follows window focus: #292C30 when active, #202326 when inactive.
+        let window_focused = ctx.input(|i| i.raw.focused);
+        let toolbar_bg = if window_focused {
+            Color32::from_rgb(0x29, 0x2C, 0x30)
+        } else {
+            Color32::from_rgb(0x20, 0x23, 0x26)
+        };
         egui::TopBottomPanel::top("toolbar")
-            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(6.0, 4.0)))
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .fill(toolbar_bg)
+                    .inner_margin(egui::Margin::symmetric(6.0, 4.0)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Extract (+ dropdown)
