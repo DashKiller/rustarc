@@ -1,0 +1,34 @@
+[package]
+name = "rustarc"
+version = "0.1.0"
+edition = "2021"
+description = "A small WinRAR-style archive manager for Linux (7z + RAR)"
+
+[dependencies]
+eframe = "0.29"
+egui_extras = "0.29"
+# 7z: pure Rust, list / extract / create
+sevenz-rust = "0.6"
+# RAR: bindings to the official UnRAR library (list / extract / test only)
+unrar = "0.5"
+# Native Wayland drag-and-drop (winit has none)
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+raw-window-handle = "0.6"
+# Local-time dates in the file list
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# ZIP, TAR and the compressors used with TAR
+zip = "2.2"
+tar = "0.4"
+flate2 = "1"
+bzip2 = "0.4"
+xz2 = { version = "0.1", features = ["static"] }
+zstd = "0.13"
+# Native file dialogs through the desktop portal (no GTK needed)
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

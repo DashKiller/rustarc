@@ -1,0 +1,1164 @@
+//! egui front-end, styled after KDE's Ark.
+
+use std::{
+    collections::{HashMap, HashSet},
+    io::Read,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{channel, Receiver, Sender},
+        Arc,
+    },
+    thread,
+};
+
+use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, Sense, Vec2};
+use egui_extras::{Column, TableBuilder};
+
+use crate::archive::{self, Entry, Format};
+use crate::icons::{self, Icon};
+use crate::wayland_dnd::{DragState, SharedDrag};
+
+// ───────────────────────────── tree model ─────────────────────────────
+
+struct Node {
+    name: String,
+    /// Full path inside the archive, without a trailing slash.
+    full: String,
+    is_dir: bool,
+    size: u64,
+    packed: Option<u64>,
+    crc: Option<u32>,
+    method: Option<String>,
+    mode: Option<String>,
+    owner: Option<String>,
+    group: Option<String>,
+    date: Option<String>,
+    version: Option<String>,
+    children: Vec<usize>,
+}
+
+#[derive(Default)]
+struct Tree {
+    nodes: Vec<Node>,
+    roots: Vec<usize>,
+}
+
+fn build_tree(entries: &[Entry]) -> Tree {
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+
+    for e in entries {
+        let comps: Vec<&str> = e.name.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+        if comps.is_empty() {
+            continue;
+        }
+        let mut cur = String::new();
+        let mut parent: Option<usize> = None;
+        for (i, c) in comps.iter().enumerate() {
+            if !cur.is_empty() {
+                cur.push('/');
+            }
+            cur.push_str(c);
+            let last = i + 1 == comps.len();
+            let idx = match index.get(&cur) {
+                Some(&i) => i,
+                None => {
+                    let idx = nodes.len();
+                    nodes.push(Node {
+                        name: c.to_string(),
+                        full: cur.clone(),
+                        is_dir: !last || e.is_dir,
+                        size: 0,
+                        packed: None,
+                        crc: None,
+                        method: None,
+                        mode: None,
+                        owner: None,
+                        group: None,
+                        date: None,
+                        version: None,
+                        children: Vec::new(),
+                    });
+                    index.insert(cur.clone(), idx);
+                    match parent {
+                        Some(p) => nodes[p].children.push(idx),
+                        None => roots.push(idx),
+                    }
+                    idx
+                }
+            };
+            if last {
+                let n = &mut nodes[idx];
+                n.is_dir = n.is_dir || e.is_dir;
+                n.size = e.size;
+                n.packed = e.packed;
+                n.crc = e.crc;
+                n.method = e.method.clone();
+                n.mode = e.mode.clone();
+                n.owner = e.owner.clone();
+                n.group = e.group.clone();
+                n.date = e.date.clone();
+                n.version = e.version.clone();
+            }
+            parent = Some(idx);
+        }
+    }
+
+    fn sum(nodes: &mut Vec<Node>, i: usize) -> u64 {
+        if !nodes[i].is_dir {
+            return nodes[i].size;
+        }
+        let kids = nodes[i].children.clone();
+        let mut total = 0;
+        for k in kids {
+            total += sum(nodes, k);
+        }
+        nodes[i].size = total;
+        total
+    }
+    for r in roots.clone() {
+        sum(&mut nodes, r);
+    }
+
+    // folders first, then case-insensitive by name
+    let keys: Vec<(bool, String)> = nodes.iter().map(|n| (!n.is_dir, n.name.to_lowercase())).collect();
+    for i in 0..nodes.len() {
+        let mut ch = std::mem::take(&mut nodes[i].children);
+        ch.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
+        nodes[i].children = ch;
+    }
+    roots.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
+
+    Tree { nodes, roots }
+}
+
+/// Flatten the tree into the rows that are currently visible: (node index, depth).
+fn visible_rows(tree: &Tree, expanded: &HashSet<String>, needle: &str) -> Vec<(usize, usize)> {
+    fn mark(tree: &Tree, i: usize, needle: &str, out: &mut Vec<bool>) -> bool {
+        let mut any = tree.nodes[i].name.to_lowercase().contains(needle);
+        for &c in &tree.nodes[i].children {
+            if mark(tree, c, needle, out) {
+                any = true;
+            }
+        }
+        out[i] = any;
+        any
+    }
+    fn walk(
+        tree: &Tree,
+        i: usize,
+        depth: usize,
+        expanded: &HashSet<String>,
+        matches: Option<&Vec<bool>>,
+        rows: &mut Vec<(usize, usize)>,
+    ) {
+        if let Some(m) = matches {
+            if !m[i] {
+                return;
+            }
+        }
+        rows.push((i, depth));
+        let n = &tree.nodes[i];
+        if n.is_dir && (matches.is_some() || expanded.contains(&n.full)) {
+            for &c in &n.children {
+                walk(tree, c, depth + 1, expanded, matches, rows);
+            }
+        }
+    }
+
+    let matches = if needle.is_empty() {
+        None
+    } else {
+        let mut m = vec![false; tree.nodes.len()];
+        for &r in &tree.roots {
+            mark(tree, r, needle, &mut m);
+        }
+        Some(m)
+    };
+    let mut rows = Vec::new();
+    for &r in &tree.roots {
+        walk(tree, r, 0, expanded, matches.as_ref(), &mut rows);
+    }
+    rows
+}
+
+// ───────────────────────────── columns ────────────────────────────────
+
+const NCOLS: usize = 10;
+const COL_NAMES: [&str; NCOLS] = [
+    "Original Size", "Compressed Size", "Mode", "Owner", "Group",
+    "Rate", "CRC checksum", "Method", "Version", "Date",
+];
+
+/// Column preferences are remembered per archive family.
+fn cols_key(f: Format) -> &'static str {
+    match f {
+        Format::SevenZ => "7z",
+        Format::Rar => "rar",
+        Format::Zip => "zip",
+        Format::Tar(_) => "tar",
+        Format::Single(_) => "single",
+    }
+}
+
+/// Default columns, following KDE Ark. (ZIP and single-file defaults are best guesses.)
+fn default_cols(f: Format) -> [bool; NCOLS] {
+    let on: &[usize] = match f {
+        Format::Rar => &[0, 1, 2, 5, 6, 7, 8],
+        Format::SevenZ => &[0, 2, 6, 7, 9],
+        Format::Tar(_) => &[0, 2, 3, 4, 9],
+        Format::Zip => &[0, 1, 5, 6, 7, 9],
+        Format::Single(_) => &[0],
+    };
+    let mut v = [false; NCOLS];
+    for &i in on {
+        v[i] = true;
+    }
+    v
+}
+
+// ──────────────────────────── app state ───────────────────────────────
+
+enum Msg {
+    Status(String),
+    Opened(PathBuf, Result<(Format, Vec<Entry>), String>),
+    Done(Result<String, String>),
+    Preview(String, Result<String, String>),
+}
+
+pub struct App {
+    path: Option<PathBuf>,
+    format: Option<Format>,
+    tree: Tree,
+    /// Visible optional columns: Original Size, Compressed Size, CRC checksum, Method.
+    show_cols: [bool; NCOLS],
+    col_prefs: HashMap<String, [bool; NCOLS]>,
+    cols_key: String,
+    table_gen: u64,
+    expanded: HashSet<String>,
+    selected: HashSet<String>,
+    last_clicked: Option<String>,
+    filter: String,
+    show_find: bool,
+    focus_find: bool,
+    password: String,
+    show_password: bool,
+    pw_retry: Option<PathBuf>,
+    preview: Option<(String, String)>,
+    status: String,
+    busy: bool,
+    pending_open: Option<PathBuf>,
+    last_title: String,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+    startup: Option<String>,
+    styled: bool,
+    dnd_rx: Receiver<PathBuf>,
+    dnd_hovering: Arc<AtomicBool>,
+    drag: SharedDrag,
+}
+
+pub fn temp_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("rustarc-{}", std::process::id()))
+}
+
+impl App {
+    pub fn new(
+        startup: Option<String>,
+        dnd_rx: Receiver<PathBuf>,
+        dnd_hovering: Arc<AtomicBool>,
+        drag: SharedDrag,
+    ) -> Self {
+        let (tx, rx) = channel();
+        Self {
+            path: None,
+            format: None,
+            tree: Tree::default(),
+            show_cols: default_cols(Format::SevenZ),
+            col_prefs: HashMap::new(),
+            cols_key: String::new(),
+            table_gen: 0,
+            expanded: HashSet::new(),
+            selected: HashSet::new(),
+            last_clicked: None,
+            filter: String::new(),
+            show_find: false,
+            focus_find: false,
+            password: String::new(),
+            show_password: false,
+            pw_retry: None,
+            preview: None,
+            status: "Open an archive (or drop one here).".into(),
+            busy: false,
+            pending_open: None,
+            last_title: String::new(),
+            tx,
+            rx,
+            startup,
+            styled: false,
+            dnd_rx,
+            dnd_hovering,
+            drag,
+        }
+    }
+
+    // ── background helpers ──
+
+    fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.status = format!("Opening {}…", path.display());
+        let (tx, ctx, pw) = (self.tx.clone(), ctx.clone(), self.password.clone());
+        thread::spawn(move || {
+            let r = archive::list(&path, &pw);
+            let _ = tx.send(Msg::Opened(path, r));
+            ctx.request_repaint();
+        });
+    }
+
+    fn run<F>(&mut self, ctx: &egui::Context, label: &str, f: F)
+    where
+        F: FnOnce(&dyn Fn(String)) -> Result<String, String> + Send + 'static,
+    {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.status = label.into();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        thread::spawn(move || {
+            let tx2 = tx.clone();
+            let ctx2 = ctx.clone();
+            let progress = move |s: String| {
+                let _ = tx2.send(Msg::Status(s));
+                ctx2.request_repaint();
+            };
+            let r = f(&progress);
+            let _ = tx.send(Msg::Done(r));
+            ctx.request_repaint();
+        });
+    }
+
+    fn pump(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                Msg::Status(s) => self.status = s,
+                Msg::Opened(path, res) => {
+                    self.busy = false;
+                    match res {
+                        Ok((fmt, entries)) => {
+                            self.tree = build_tree(&entries);
+                            self.expanded.clear(); // folders start collapsed
+                            self.status = format!("{} archive", fmt.label());
+                            let key = cols_key(fmt);
+                            self.cols_key = key.to_string();
+                            self.table_gen += 1;
+                            self.show_cols = self.col_prefs.get(key).copied().unwrap_or_else(|| default_cols(fmt));
+                            self.format = Some(fmt);
+                            self.selected.clear();
+                            self.last_clicked = None;
+                            self.path = Some(path);
+                        }
+                        Err(e) => {
+                            if e.to_lowercase().contains("password") {
+                                self.pw_retry = Some(path);
+                                self.show_password = true;
+                                self.status = "This archive needs a password.".into();
+                            } else {
+                                self.status = format!("Error: {e}");
+                            }
+                        }
+                    }
+                }
+                Msg::Done(res) => {
+                    self.busy = false;
+                    self.status = match res {
+                        Ok(s) => s,
+                        Err(e) => format!("Error: {e}"),
+                    };
+                    if let Some(p) = self.pending_open.take() {
+                        self.open(ctx, p);
+                    }
+                }
+                Msg::Preview(name, res) => {
+                    self.busy = false;
+                    match res {
+                        Ok(text) => {
+                            self.status = format!("Preview: {name}");
+                            self.preview = Some((name, text));
+                        }
+                        Err(e) => self.status = e,
+                    }
+                }
+            }
+        }
+    }
+
+    // ── actions ──
+
+    fn pick_and_open(&mut self, ctx: &egui::Context) {
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter(
+                "Archives",
+                &[
+                    "7z", "rar", "zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst",
+                    "tzst", "jar", "apk", "cbz",
+                ],
+            )
+            .pick_file()
+        {
+            self.open(ctx, p);
+        }
+    }
+
+    fn selected_files(&self) -> Vec<String> {
+        self.tree
+            .nodes
+            .iter()
+            .filter(|n| !n.is_dir && self.selected.contains(&n.full))
+            .map(|n| n.full.clone())
+            .collect()
+    }
+
+    fn extract(&mut self, ctx: &egui::Context, only_selected: bool) {
+        let Some(path) = self.path.clone() else { return };
+        let Some(dest) = rfd::FileDialog::new().set_title("Extract to…").pick_folder() else {
+            return;
+        };
+        let sel: Option<HashSet<String>> = only_selected.then(|| self.selected.clone());
+        let pw = self.password.clone();
+        self.run(ctx, "Extracting…", move |p| {
+            archive::extract(&path, &dest, sel.as_ref(), &pw, p)
+        });
+    }
+
+    fn test(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.path.clone() else { return };
+        let pw = self.password.clone();
+        self.run(ctx, "Testing…", move |p| archive::test(&path, &pw, p));
+    }
+
+    fn open_external(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.path.clone() else { return };
+        let Some(full) = self.selected_files().into_iter().next() else { return };
+        let pw = self.password.clone();
+        self.run(ctx, "Opening…", move |p| {
+            let dest = temp_dir();
+            let mut sel = HashSet::new();
+            sel.insert(full.clone());
+            archive::extract(&path, &dest, Some(&sel), &pw, p)?;
+            std::process::Command::new("xdg-open")
+                .arg(dest.join(full.rsplit('/').next().unwrap_or(&full)))
+                .spawn()
+                .map_err(|e| format!("Could not start xdg-open: {e}"))?;
+            Ok(format!("Opened {full}"))
+        });
+    }
+
+    fn preview_selected(&mut self, ctx: &egui::Context) {
+        if self.busy {
+            return;
+        }
+        let Some(path) = self.path.clone() else { return };
+        let Some(full) = self.selected_files().into_iter().next() else { return };
+        let pw = self.password.clone();
+        self.busy = true;
+        self.status = "Preparing preview…".into();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let dest = temp_dir();
+                let mut sel = HashSet::new();
+                sel.insert(full.clone());
+                archive::extract(&path, &dest, Some(&sel), &pw, &|_| {})?;
+                let mut buf = Vec::new();
+                std::fs::File::open(dest.join(full.rsplit('/').next().unwrap_or(&full)))
+                    .map_err(|e| e.to_string())?
+                    .take(512 * 1024)
+                    .read_to_end(&mut buf)
+                    .map_err(|e| e.to_string())?;
+                if buf.contains(&0) {
+                    return Err("Binary file – no text preview. Use \"Open in External Application\".".into());
+                }
+                Ok(String::from_utf8_lossy(&buf).into_owned())
+            })();
+            let _ = tx.send(Msg::Preview(full, result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Drag the selected items out of the window; they are extracted to a temp folder and
+    /// handed to whatever the user drops them on.
+    fn begin_drag_out(&mut self) {
+        let Some(path) = self.path.clone() else { return };
+        // only top-level selections: a selected folder already covers its children
+        let tops: Vec<String> = self
+            .selected
+            .iter()
+            .filter(|p| {
+                !self
+                    .selected
+                    .iter()
+                    .any(|q| q.as_str() != p.as_str() && p.starts_with(&format!("{q}/")))
+            })
+            .cloned()
+            .collect();
+        if tops.is_empty() {
+            return;
+        }
+
+        let state = DragState::new();
+        let started = self
+            .drag
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|h| h.start(state.clone())))
+            .unwrap_or(false);
+        if !started {
+            self.status = "Dragging files out is only supported on Wayland.".into();
+            return;
+        }
+        self.status = format!("Dragging {} item(s)…", tops.len());
+
+        let pw = self.password.clone();
+        thread::spawn(move || {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dest = temp_dir().join(format!("drag-{nanos}"));
+            let sel: HashSet<String> = tops.iter().cloned().collect();
+            let result = archive::extract(&path, &dest, Some(&sel), &pw, &|_| {}).map(|_| {
+                tops.iter()
+                    .map(|t| dest.join(t.rsplit('/').next().unwrap_or(t)))
+                    .collect::<Vec<PathBuf>>()
+            });
+            state.finish(result);
+        });
+    }
+
+    fn create_archive(&mut self, ctx: &egui::Context, folders: bool) {
+        let dialog = rfd::FileDialog::new().set_title("Choose what to add");
+        let sources: Vec<PathBuf> = if folders {
+            dialog.pick_folders().unwrap_or_default()
+        } else {
+            dialog.pick_files().unwrap_or_default()
+        };
+        if sources.is_empty() {
+            return;
+        }
+        let Some(dest) = rfd::FileDialog::new()
+            .set_title("Save new archive as…")
+            .add_filter("7-Zip", &["7z"])
+            .add_filter("ZIP", &["zip"])
+            .add_filter("TAR.GZ", &["tar.gz", "tgz"])
+            .add_filter("TAR.BZ2", &["tar.bz2"])
+            .add_filter("TAR.XZ", &["tar.xz"])
+            .add_filter("TAR.ZST", &["tar.zst"])
+            .add_filter("TAR", &["tar"])
+            .set_file_name("archive.7z")
+            .save_file()
+        else {
+            return;
+        };
+        // The extension you type decides the format (.7z, .zip, .tar.gz, …); default is .7z.
+        let dest = archive::normalize_dest(dest);
+        self.pending_open = Some(dest.clone());
+        self.run(ctx, "Compressing…", move |p| archive::create(&sources, &dest, p));
+    }
+}
+
+// ───────────────────────────── widgets ────────────────────────────────
+
+fn human(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let (mut v, mut i) = (n as f64, 0);
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
+/// Ark-style toolbar button: icon + text, flat until hovered.
+fn tool_button(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egui::Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let color = if enabled { ui.visuals().text_color() } else { Color32::from_rgb(127, 140, 141) };
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, color);
+    let (pad, isz, gap) = (8.0, 18.0, 6.0);
+    let size = Vec2::new(pad + isz + gap + galley.size().x + pad, 30.0);
+    let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    if enabled && resp.hovered() {
+        ui.painter().rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(rect.left() + pad + isz / 2.0, rect.center().y),
+        Vec2::splat(isz),
+    );
+    icons::draw(ui.painter(), icon_rect, icon, color);
+    ui.painter().galley(
+        Pos2::new(icon_rect.right() + gap, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    resp
+}
+
+fn type_color(_icon: Icon, visuals: &egui::Visuals) -> Color32 {
+    visuals.text_color()
+}
+
+/// Breeze Dark look (as used by KDE Ark).
+fn ark_visuals() -> egui::Visuals {
+    use egui::{Rounding, Stroke};
+    let mut v = egui::Visuals::dark();
+    let text = Color32::from_rgb(239, 240, 241);
+    let panel = Color32::from_rgb(42, 46, 50);
+    let base = Color32::from_rgb(35, 38, 41);
+    let button = Color32::from_rgb(49, 54, 59);
+    let hover = Color32::from_rgb(61, 67, 73);
+    let line = Color32::from_rgb(62, 68, 74);
+    let accent = Color32::from_rgb(61, 174, 233);
+
+    v.panel_fill = panel;
+    v.window_fill = panel;
+    v.extreme_bg_color = base;
+    v.faint_bg_color = panel;
+    v.window_stroke = Stroke::new(1.0_f32, line);
+    v.hyperlink_color = accent;
+    v.selection.bg_fill = accent;
+    v.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
+
+    let r = Rounding::same(4.0);
+    v.widgets.noninteractive.bg_fill = panel;
+    v.widgets.noninteractive.weak_bg_fill = panel;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, line);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, text);
+
+    for w in [&mut v.widgets.inactive, &mut v.widgets.open] {
+        w.bg_fill = button;
+        w.weak_bg_fill = button;
+        w.bg_stroke = Stroke::new(1.0_f32, line);
+        w.fg_stroke = Stroke::new(1.0_f32, text);
+        w.rounding = r;
+    }
+    v.widgets.hovered.bg_fill = hover;
+    v.widgets.hovered.weak_bg_fill = hover;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, accent);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+    v.widgets.hovered.rounding = r;
+    v.widgets.active.bg_fill = button;
+    v.widgets.active.weak_bg_fill = button;
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+    v.widgets.active.rounding = r;
+    v
+}
+
+// ───────────────────────────── main loop ──────────────────────────────
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.styled {
+            ctx.set_visuals(ark_visuals());
+            self.styled = true;
+        }
+        if let Some(p) = self.startup.take() {
+            self.open(ctx, PathBuf::from(p));
+        }
+        self.pump(ctx);
+
+        // Drag & drop: open the first dropped file (X11 via egui, Wayland via wayland_dnd.rs).
+        let mut dropped = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
+        while let Ok(p) = self.dnd_rx.try_recv() {
+            dropped = Some(p);
+        }
+        if let Some(p) = dropped {
+            self.open(ctx, p);
+        }
+
+        // Keyboard shortcuts
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            self.show_find = !self.show_find;
+            self.focus_find = self.show_find;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+            self.pick_and_open(ctx);
+        }
+
+        // Window title like Ark: "<file> — RustArc"
+        let title = match &self.path {
+            Some(p) => format!(
+                "{} — RustArc",
+                p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            ),
+            None => "RustArc".to_string(),
+        };
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
+
+        let has = self.path.is_some() && !self.busy;
+        let has_file_sel = has && !self.selected_files().is_empty();
+
+        // ── toolbar ──
+        egui::TopBottomPanel::top("toolbar")
+            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(6.0, 4.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Extract (+ dropdown)
+                    if tool_button(ui, Icon::Extract, "Extract", has).clicked() {
+                        let only_selected = !self.selected.is_empty();
+                        self.extract(ctx, only_selected);
+                    }
+                    ui.add_enabled_ui(has, |ui| {
+                        let r = ui.menu_button("  ", |ui| {
+                            if ui.button("Extract all…").clicked() {
+                                ui.close_menu();
+                                self.extract(ctx, false);
+                            }
+                            if ui
+                                .add_enabled(!self.selected.is_empty(), egui::Button::new("Extract selected…"))
+                                .clicked()
+                            {
+                                ui.close_menu();
+                                self.extract(ctx, true);
+                            }
+                        });
+                        icons::draw(
+                            ui.painter(),
+                            Rect::from_center_size(r.response.rect.center(), Vec2::splat(12.0)),
+                            Icon::ChevronDown,
+                            ui.visuals().text_color(),
+                        );
+                    });
+
+                    tool_button(ui, Icon::Add, "Add Files", false)
+                        .on_hover_text("Modifying existing archives is not supported yet");
+
+                    if tool_button(ui, Icon::Find, "Find", true).clicked() {
+                        self.show_find = !self.show_find;
+                        self.focus_find = self.show_find;
+                    }
+
+                    ui.separator();
+
+                    if tool_button(ui, Icon::Preview, "Preview", has_file_sel).clicked() {
+                        self.preview_selected(ctx);
+                    }
+                    if tool_button(ui, Icon::Open, "Open in External Application", has_file_sel).clicked() {
+                        self.open_external(ctx);
+                    }
+                    tool_button(ui, Icon::Remove, "Remove from Archive", false)
+                        .on_hover_text("Modifying existing archives is not supported yet");
+
+                    // Hamburger menu on the right
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let r = ui.menu_button("      ", |ui| {
+                            if ui.button("Open archive…").clicked() {
+                                ui.close_menu();
+                                self.pick_and_open(ctx);
+                            }
+                            if ui.add_enabled(!self.busy, egui::Button::new("New archive from files…")).clicked() {
+                                ui.close_menu();
+                                self.create_archive(ctx, false);
+                            }
+                            if ui.add_enabled(!self.busy, egui::Button::new("New archive from folders…")).clicked() {
+                                ui.close_menu();
+                                self.create_archive(ctx, true);
+                            }
+                            ui.separator();
+                            if ui.add_enabled(has, egui::Button::new("Extract all…")).clicked() {
+                                ui.close_menu();
+                                self.extract(ctx, false);
+                            }
+                            if ui
+                                .add_enabled(has && !self.selected.is_empty(), egui::Button::new("Extract selected…"))
+                                .clicked()
+                            {
+                                ui.close_menu();
+                                self.extract(ctx, true);
+                            }
+                            if ui.add_enabled(has, egui::Button::new("Test archive")).clicked() {
+                                ui.close_menu();
+                                self.test(ctx);
+                            }
+                            ui.separator();
+                            if ui.button("Set password…").clicked() {
+                                ui.close_menu();
+                                self.show_password = true;
+                            }
+                            if ui.add_enabled(has, egui::Button::new("Reload")).clicked() {
+                                ui.close_menu();
+                                if let Some(p) = self.path.clone() {
+                                    self.open(ctx, p);
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Quit").clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                        icons::draw(
+                            ui.painter(),
+                            Rect::from_center_size(r.response.rect.center(), Vec2::splat(16.0)),
+                            Icon::Menu,
+                            ui.visuals().text_color(),
+                        );
+                    });
+                });
+            });
+
+        // ── find bar ──
+        if self.show_find {
+            egui::TopBottomPanel::top("findbar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    icons::draw(
+                        ui.painter(),
+                        Rect::from_center_size(
+                            ui.cursor().left_center() + Vec2::new(9.0, 0.0),
+                            Vec2::splat(16.0),
+                        ),
+                        Icon::Find,
+                        ui.visuals().weak_text_color(),
+                    );
+                    ui.add_space(22.0);
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text("Find…")
+                            .desired_width(260.0),
+                    );
+                    if self.focus_find {
+                        r.request_focus();
+                        self.focus_find = false;
+                    }
+                    if ui.button("Close").clicked() {
+                        self.show_find = false;
+                        self.filter.clear();
+                    }
+                });
+            });
+        } else if !self.filter.is_empty() {
+            self.filter.clear();
+        }
+
+        // ── status bar ──
+        let (mut folders, mut files, mut total) = (0usize, 0usize, 0u64);
+        for n in &self.tree.nodes {
+            if n.is_dir {
+                folders += 1;
+            } else {
+                files += 1;
+                total += n.size;
+            }
+        }
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if self.busy {
+                    ui.spinner();
+                }
+                ui.label(&self.status);
+                if self.path.is_some() {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let sel = if self.selected.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{} selected   ", self.selected.len())
+                        };
+                        ui.label(format!(
+                            "{sel}{folders} folder(s), {files} file(s), {}",
+                            human(total)
+                        ));
+                    });
+                }
+            });
+        });
+
+        // ── file tree ──
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(Color32::from_rgb(35, 38, 41)))
+            .show(ctx, |ui| {
+            if self.path.is_none() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Drop an archive here (7z, RAR, ZIP, TAR, GZ, …), or open one from the menu.");
+                });
+                return;
+            }
+
+            let needle = self.filter.to_lowercase();
+            let filtering = !needle.is_empty();
+            let rows = visible_rows(&self.tree, &self.expanded, &needle);
+
+            let multi = ui.input(|i| i.modifiers.command);
+            let range = ui.input(|i| i.modifiers.shift);
+            let weak = ui.visuals().weak_text_color();
+            let visuals = ui.visuals().clone();
+
+            let mut toggle: Option<String> = None;
+            let mut clicked: Option<usize> = None;
+            let mut dbl: Option<usize> = None;
+            let mut drag_start: Option<usize> = None;
+
+            // Optional columns; right-click a header to show / hide them.
+            let vis = self.show_cols;
+            let mut new_cols = vis;
+
+            ui.push_id(self.table_gen, |ui| {
+            let mut table = TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .sense(Sense::click_and_drag())
+                .column(Column::remainder().at_least(200.0).clip(true));
+            let mut headers: Vec<&str> = vec!["Name"];
+            for k in 0..NCOLS {
+                if vis[k] {
+                    table = table.column(Column::auto());
+                    headers.push(COL_NAMES[k]);
+                }
+            }
+
+            table
+                .header(26.0, |mut h| {
+                    for (i, t) in headers.iter().enumerate() {
+                        h.col(|ui| {
+                            let resp = ui.interact(ui.max_rect(), ui.id().with(("col_header", i)), Sense::click());
+                            resp.context_menu(|ui| {
+                                for k in 0..NCOLS {
+                                    ui.checkbox(&mut new_cols[k], COL_NAMES[k]);
+                                }
+                            });
+                            ui.horizontal_centered(|ui| {
+                                if i == 0 {
+                                    ui.add_space(8.0);
+                                }
+                                ui.label(*t);
+                                ui.add_space(6.0);
+                            });
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(26.0, rows.len(), |mut row| {
+                        let (ni, depth) = rows[row.index()];
+                        let n = &self.tree.nodes[ni];
+                        row.set_selected(self.selected.contains(&n.full));
+
+                        row.col(|ui| {
+                            ui.horizontal_centered(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.add_space(8.0 + depth as f32 * 18.0);
+                                if n.is_dir {
+                                    let open = filtering || self.expanded.contains(&n.full);
+                                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
+                                    icons::draw(
+                                        ui.painter(),
+                                        r.shrink(2.0),
+                                        if open { Icon::ChevronDown } else { Icon::ChevronRight },
+                                        weak,
+                                    );
+                                    if resp.clicked() {
+                                        toggle = Some(n.full.clone());
+                                    }
+                                } else {
+                                    ui.add_space(16.0);
+                                }
+                                let icon = if n.is_dir { Icon::Folder } else { icons::for_file(&n.name) };
+                                let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                                icons::draw(ui.painter(), r, icon, type_color(icon, &visuals));
+                                ui.add(egui::Label::new(n.name.as_str()).selectable(false));
+                            });
+                        });
+
+                        for k in 0..NCOLS {
+                            if !vis[k] {
+                                continue;
+                            }
+                            row.col(|ui| {
+                                ui.horizontal_centered(|ui| {
+                                    let text: Option<String> = match k {
+                                        0 => Some(human(n.size)),
+                                        1 => n.packed.map(human),
+                                        2 => n.mode.clone(),
+                                        3 => n.owner.clone(),
+                                        4 => n.group.clone(),
+                                        5 => match n.packed {
+                                            Some(p) if n.size > 0 && !n.is_dir => {
+                                                let saved = (1.0 - p as f64 / n.size as f64) * 100.0;
+                                                Some(format!("{:.0} %", saved.max(0.0)))
+                                            }
+                                            _ => None,
+                                        },
+                                        6 => n.crc.map(|c| format!("{c:08X}")),
+                                        7 => n.method.clone(),
+                                        8 => n.version.clone(),
+                                        _ => n.date.clone(),
+                                    };
+                                    if let Some(t) = text {
+                                        ui.add(egui::Label::new(t).selectable(false));
+                                    }
+                                    ui.add_space(6.0);
+                                });
+                            });
+                        }
+
+                        let resp = row.response();
+                        if resp.drag_started() {
+                            drag_start = Some(ni);
+                        } else if resp.double_clicked() {
+                            dbl = Some(ni);
+                        } else if resp.clicked() {
+                            clicked = Some(ni);
+                        }
+                    });
+                });
+            });
+            if new_cols != self.show_cols {
+                self.table_gen += 1;
+                self.show_cols = new_cols;
+                self.col_prefs.insert(self.cols_key.clone(), new_cols);
+            }
+
+            if let Some(full) = toggle {
+                if !self.expanded.remove(&full) {
+                    self.expanded.insert(full);
+                }
+            }
+
+            if let Some(idx) = clicked {
+                let full = self.tree.nodes[idx].full.clone();
+                let mut ranged = false;
+                if range {
+                    if let Some(last) = self.last_clicked.clone() {
+                        let a = rows.iter().position(|(n, _)| self.tree.nodes[*n].full == last);
+                        let b = rows.iter().position(|(n, _)| *n == idx);
+                        if let (Some(a), Some(b)) = (a, b) {
+                            if !multi {
+                                self.selected.clear();
+                            }
+                            for r in a.min(b)..=a.max(b) {
+                                self.selected.insert(self.tree.nodes[rows[r].0].full.clone());
+                            }
+                            ranged = true;
+                        }
+                    }
+                }
+                if !ranged {
+                    if multi {
+                        if !self.selected.remove(&full) {
+                            self.selected.insert(full.clone());
+                        }
+                    } else {
+                        self.selected.clear();
+                        self.selected.insert(full.clone());
+                    }
+                    self.last_clicked = Some(full);
+                }
+            }
+
+            if let Some(idx) = drag_start {
+                let full = self.tree.nodes[idx].full.clone();
+                if !self.selected.contains(&full) {
+                    self.selected.clear();
+                    self.selected.insert(full.clone());
+                    self.last_clicked = Some(full);
+                }
+                self.begin_drag_out();
+            }
+
+            if let Some(idx) = dbl {
+                let (full, is_dir) = {
+                    let n = &self.tree.nodes[idx];
+                    (n.full.clone(), n.is_dir)
+                };
+                if is_dir {
+                    if !self.expanded.remove(&full) {
+                        self.expanded.insert(full);
+                    }
+                } else {
+                    self.selected.clear();
+                    self.selected.insert(full);
+                    self.open_external(ctx);
+                }
+            }
+        });
+
+        // ── password dialog ──
+        if self.show_password {
+            let mut open = true;
+            let mut apply = false;
+            egui::Window::new("Password")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("Enter the archive password:");
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    if ui.button("OK").clicked() {
+                        apply = true;
+                    }
+                });
+            if apply {
+                self.show_password = false;
+                if let Some(p) = self.pw_retry.take().or_else(|| self.path.clone()) {
+                    self.open(ctx, p);
+                }
+            } else {
+                self.show_password = open;
+            }
+        }
+
+        // ── preview window ──
+        let mut close_preview = false;
+        if let Some((name, text)) = &self.preview {
+            let mut open = true;
+            egui::Window::new(format!("Preview – {name}"))
+                .open(&mut open)
+                .default_size([640.0, 420.0])
+                .show(ctx, |ui| {
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        let mut t = text.as_str();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut t)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                });
+            close_preview = !open;
+        }
+        if close_preview {
+            self.preview = None;
+        }
+
+        // ── drag-over overlay ──
+        if self.dnd_hovering.load(Ordering::Relaxed)
+            || ctx.input(|i| !i.raw.hovered_files.is_empty())
+        {
+            let screen = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            painter.rect_filled(screen, 0.0, Color32::from_black_alpha(170));
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop archive to open",
+                egui::FontId::proportional(28.0),
+                Color32::WHITE,
+            );
+        }
+    }
+}

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=RustArc
+Comment=Archive manager for 7z and RAR
+Exec=rustarc %f
+Icon=rustarc
+Terminal=false
+Categories=Utility;Archiving;Compression;
+MimeType=application/x-7z-compressed;application/vnd.rar;application/x-rar;application/x-rar-compressed;

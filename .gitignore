@@ -1,0 +1,12 @@
+# Rust build output
+/target/
+
+# AppImage build output
+/build/
+*.AppImage
+
+# Editor / OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store

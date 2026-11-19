@@ -1,0 +1,14 @@
+name: Build AppImage
+on: [push, workflow_dispatch]
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev curl
+      - run: ./build-appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RustArc-AppImage
+          path: RustArc-x86_64.AppImage
