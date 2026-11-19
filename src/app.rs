@@ -219,6 +219,21 @@ fn default_cols(f: Format) -> [bool; NCOLS] {
     v
 }
 
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Preview,
+    OpenExternal,
+    OpenWith,
+    Rename,
+    Remove,
+    ExtractSelected,
+    ExtractAll,
+    Cut,
+    Copy,
+    Paste,
+    AddFiles,
+}
+
 // ──────────────────────────── app state ───────────────────────────────
 
 enum Msg {
@@ -250,6 +265,8 @@ pub struct App {
     pw_retry: Option<PathBuf>,
     preview: Option<(String, String)>,
     confirm_remove: Option<Vec<String>>,
+    rename: Option<(String, String)>,
+    clipboard: Option<(PathBuf, Vec<String>, bool)>,
     status: String,
     busy: bool,
     pending_open: Option<PathBuf>,
@@ -295,6 +312,8 @@ impl App {
             pw_retry: None,
             preview: None,
             confirm_remove: None,
+            rename: None,
+            clipboard: None,
             status: "Open an archive (or drop one here).".into(),
             busy: false,
             pending_open: None,
@@ -457,7 +476,7 @@ impl App {
         self.run(ctx, "Testing…", move |p| archive::test(&path, &pw, p));
     }
 
-    fn open_external(&mut self, ctx: &egui::Context) {
+    fn open_external(&mut self, ctx: &egui::Context, ask: bool) {
         let Some(path) = self.path.clone() else { return };
         let Some(full) = self.selected_files().into_iter().next() else { return };
         let pw = self.password.clone();
@@ -466,8 +485,12 @@ impl App {
             let mut sel = HashSet::new();
             sel.insert(full.clone());
             archive::extract(&path, &dest, Some(&sel), &pw, p)?;
+            let target = dest.join(full.rsplit('/').next().unwrap_or(&full));
+            if ask {
+                return archive::open_with_chooser(&target);
+            }
             std::process::Command::new("xdg-open")
-                .arg(dest.join(full.rsplit('/').next().unwrap_or(&full)))
+                .arg(&target)
                 .spawn()
                 .map_err(|e| format!("Could not start xdg-open: {e}"))?;
             Ok(format!("Opened {full}"))
@@ -568,6 +591,82 @@ impl App {
             })
             .cloned()
             .collect()
+    }
+
+    fn begin_rename(&mut self) {
+        if self.selected.len() != 1 {
+            return;
+        }
+        if let Some(full) = self.selected.iter().next().cloned() {
+            let name = full.rsplit('/').next().unwrap_or(&full).to_string();
+            self.rename = Some((full, name));
+        }
+    }
+
+    fn do_rename(&mut self, ctx: &egui::Context, full: String, new_name: String) {
+        let Some(path) = self.path.clone() else { return };
+        let pw = self.password.clone();
+        self.pending_open = Some(path.clone());
+        self.run(ctx, "Renaming…", move |p| archive::rename_item(&path, &full, &new_name, &pw, p));
+    }
+
+    /// Cut / copy the selection inside the archive (pasted with `paste`).
+    fn clip_set(&mut self, ctx: &egui::Context, cut: bool) {
+        let Some(path) = self.path.clone() else { return };
+        let items = self.top_level_selection();
+        if items.is_empty() {
+            return;
+        }
+        // also put the names on the system clipboard so Ctrl+V reaches us
+        ctx.copy_text(items.join("\n"));
+        self.status = format!("{} {} item(s)", if cut { "Cut" } else { "Copied" }, items.len());
+        self.clipboard = Some((path, items, cut));
+    }
+
+    /// Folder that a paste goes into: the selected folder, or the folder of the selected file.
+    fn paste_target(&self) -> String {
+        if self.selected.len() == 1 {
+            if let Some(full) = self.selected.iter().next() {
+                let is_dir = self.tree.nodes.iter().any(|n| n.is_dir && &n.full == full);
+                if is_dir {
+                    return full.clone();
+                }
+                return full.rfind('/').map(|i| full[..i].to_string()).unwrap_or_default();
+            }
+        }
+        String::new()
+    }
+
+    fn paste(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.path.clone() else { return };
+        let Some((clip_path, items, cut)) = self.clipboard.clone() else { return };
+        if clip_path != path {
+            self.status = "Paste only works inside the archive the items were copied from.".into();
+            return;
+        }
+        let dest = self.paste_target();
+        let pw = self.password.clone();
+        if cut {
+            self.clipboard = None;
+        }
+        self.pending_open = Some(path.clone());
+        self.run(ctx, "Pasting…", move |p| archive::paste_items(&path, &items, &dest, cut, &pw, p));
+    }
+
+    fn menu_action(&mut self, ctx: &egui::Context, act: MenuAction) {
+        match act {
+            MenuAction::Preview => self.preview_selected(ctx),
+            MenuAction::OpenExternal => self.open_external(ctx, false),
+            MenuAction::OpenWith => self.open_external(ctx, true),
+            MenuAction::Rename => self.begin_rename(),
+            MenuAction::Remove => self.confirm_remove = Some(self.top_level_selection()),
+            MenuAction::ExtractSelected => self.extract(ctx, true),
+            MenuAction::ExtractAll => self.extract(ctx, false),
+            MenuAction::Cut => self.clip_set(ctx, true),
+            MenuAction::Copy => self.clip_set(ctx, false),
+            MenuAction::Paste => self.paste(ctx),
+            MenuAction::AddFiles => self.add_files(ctx, false),
+        }
     }
 
     fn remove_selected(&mut self, ctx: &egui::Context, items: Vec<String>) {
@@ -848,6 +947,41 @@ impl eframe::App for App {
         let has_file_sel = has && !self.selected_files().is_empty();
         let can_add = has && self.format.map(archive::can_add).unwrap_or(false);
 
+        // Shortcuts shown in the context menu
+        if !ctx.wants_keyboard_input() && has {
+            let has_items = !self.selected.is_empty();
+            if has_file_sel && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+                self.preview_selected(ctx);
+            }
+            if has_items && can_add && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2)) {
+                self.begin_rename();
+            }
+            if has_items && can_add && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)) {
+                self.confirm_remove = Some(self.top_level_selection());
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::E)) {
+                self.extract(ctx, has_items);
+            }
+            if can_add && ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::A)) {
+                self.add_files(ctx, false);
+            }
+            let (ev_copy, ev_cut, ev_paste) = ctx.input(|i| {
+                (
+                    i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
+                )
+            });
+            if can_add && has_items && ev_cut {
+                self.clip_set(ctx, true);
+            } else if can_add && has_items && ev_copy {
+                self.clip_set(ctx, false);
+            }
+            if can_add && ev_paste {
+                self.paste(ctx);
+            }
+        }
+
         // ── toolbar ──
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(6.0, 4.0)))
@@ -899,7 +1033,7 @@ impl eframe::App for App {
                         self.preview_selected(ctx);
                     }
                     if tool_button(ui, Icon::Open, "Open in External Application", has_file_sel).clicked() {
-                        self.open_external(ctx);
+                        self.open_external(ctx, false);
                     }
                     let can_remove = can_add && !self.selected.is_empty();
                     let r = tool_button(ui, Icon::Remove, "Remove from Archive", can_remove);
@@ -1076,6 +1210,18 @@ impl eframe::App for App {
             let mut clicked: Option<usize> = None;
             let mut dbl: Option<usize> = None;
             let mut drag_start: Option<usize> = None;
+            let mut right_clicked: Option<usize> = None;
+            let mut menu_action: Option<MenuAction> = None;
+            // facts the context menu needs (the table closure only borrows `self` immutably)
+            let m_file_sel = has_file_sel;
+            let m_can_modify = can_add;
+            let m_single = self.selected.len() == 1;
+            let m_has_sel = !self.selected.is_empty();
+            let m_has_clip = self
+                .clipboard
+                .as_ref()
+                .map(|c| self.path.as_ref() == Some(&c.0))
+                .unwrap_or(false);
 
             // Optional columns; right-click a header to show / hide them.
             let vis = self.show_cols;
@@ -1193,6 +1339,67 @@ impl eframe::App for App {
                         }
 
                         let resp = row.response();
+                        if resp.secondary_clicked() {
+                            right_clicked = Some(ni);
+                        }
+                        if !n.is_dir {
+                            resp.clone().context_menu(|ui| {
+                                // plain helper: returns true when clicked (so it holds no borrow of `menu_action`)
+                                let item = |ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool| -> bool {
+                                    ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut))
+                                        .clicked()
+                                };
+                                if item(ui, "Preview", "Ctrl+P", m_file_sel) {
+                                    menu_action = Some(MenuAction::Preview);
+                                    ui.close_menu();
+                                }
+                                if item(ui, "Open in External Application", "", m_file_sel) {
+                                    menu_action = Some(MenuAction::OpenExternal);
+                                    ui.close_menu();
+                                }
+                                if item(ui, "Open With…", "", m_file_sel) {
+                                    menu_action = Some(MenuAction::OpenWith);
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if item(ui, "Rename…", "F2", m_can_modify && m_single) {
+                                    menu_action = Some(MenuAction::Rename);
+                                    ui.close_menu();
+                                }
+                                if item(ui, "Remove from Archive", "Del", m_can_modify && m_has_sel) {
+                                    menu_action = Some(MenuAction::Remove);
+                                    ui.close_menu();
+                                }
+                                ui.menu_button("Extract", |ui| {
+                                    if item(ui, "Extract selected…", "Ctrl+E", m_has_sel) {
+                                        menu_action = Some(MenuAction::ExtractSelected);
+                                        ui.close_menu();
+                                    }
+                                    if item(ui, "Extract all…", "", true) {
+                                        menu_action = Some(MenuAction::ExtractAll);
+                                        ui.close_menu();
+                                    }
+                                });
+                                ui.separator();
+                                if item(ui, "Cut", "Ctrl+X", m_can_modify && m_has_sel) {
+                                    menu_action = Some(MenuAction::Cut);
+                                    ui.close_menu();
+                                }
+                                if item(ui, "Copy", "Ctrl+C", m_can_modify && m_has_sel) {
+                                    menu_action = Some(MenuAction::Copy);
+                                    ui.close_menu();
+                                }
+                                if item(ui, "Paste", "Ctrl+V", m_can_modify && m_has_clip) {
+                                    menu_action = Some(MenuAction::Paste);
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if item(ui, "Add Files…", "Alt+A", m_can_modify) {
+                                    menu_action = Some(MenuAction::AddFiles);
+                                    ui.close_menu();
+                                }
+                            });
+                        }
                         if resp.drag_started() {
                             drag_start = Some(ni);
                         } else if resp.double_clicked() {
@@ -1247,6 +1454,18 @@ impl eframe::App for App {
                 }
             }
 
+            if let Some(idx) = right_clicked {
+                let full = self.tree.nodes[idx].full.clone();
+                if !self.selected.contains(&full) {
+                    self.selected.clear();
+                    self.selected.insert(full.clone());
+                    self.last_clicked = Some(full);
+                }
+            }
+            if let Some(act) = menu_action {
+                self.menu_action(ctx, act);
+            }
+
             if let Some(idx) = drag_start {
                 let full = self.tree.nodes[idx].full.clone();
                 if !self.selected.contains(&full) {
@@ -1269,7 +1488,7 @@ impl eframe::App for App {
                 } else {
                     self.selected.clear();
                     self.selected.insert(full);
-                    self.open_external(ctx);
+                    self.open_external(ctx, false);
                 }
             }
         });
@@ -1300,6 +1519,38 @@ impl eframe::App for App {
             } else {
                 self.show_password = open;
             }
+        }
+
+        // ── rename dialog ──
+        let mut rename_apply: Option<(String, String)> = None;
+        let mut rename_cancel = false;
+        if let Some((full, text)) = self.rename.as_mut() {
+            egui::Window::new("Rename")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("New name:");
+                    let r = ui.add(egui::TextEdit::singleline(&mut *text).desired_width(280.0));
+                    r.request_focus();
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Rename").clicked() || enter {
+                            rename_apply = Some((full.clone(), text.clone()));
+                        }
+                        if ui.button("Cancel").clicked() || esc {
+                            rename_cancel = true;
+                        }
+                    });
+                });
+        }
+        if let Some((f, n)) = rename_apply {
+            self.rename = None;
+            self.do_rename(ctx, f, n);
+        } else if rename_cancel {
+            self.rename = None;
         }
 
         // ── confirm removal ──

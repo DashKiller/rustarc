@@ -1281,3 +1281,227 @@ fn add_tar<W: Write>(
     }
     Ok(())
 }
+
+
+// ───────────────────── rename / cut / copy / paste / open with ─────────────────────
+
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let p = dir.join(name);
+    if !p.exists() {
+        return p;
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string());
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let mut n = 1;
+    loop {
+        let cand = if n == 1 {
+            format!("{stem} (copy){ext}")
+        } else {
+            format!("{stem} (copy {n}){ext}")
+        };
+        let p = dir.join(&cand);
+        if !p.exists() {
+            return p;
+        }
+        n += 1;
+    }
+}
+
+/// Rename a file or folder inside the archive (`new_name` is just the new last component).
+pub fn rename_item(
+    archive: &Path,
+    old_full: &str,
+    new_name: &str,
+    password: &str,
+    progress: Progress,
+) -> Result<String, String> {
+    let fmt = Format::detect(archive).ok_or("Unsupported archive format")?;
+    let kind = kind_of(fmt).ok_or("Renaming is not supported for this archive type")?;
+    let old = old_full.trim_matches('/').to_string();
+    let new_name = new_name.trim().to_string();
+    if new_name.is_empty()
+        || new_name == "."
+        || new_name == ".."
+        || new_name.contains('/')
+        || new_name.contains('\\')
+    {
+        return Err("Invalid name".into());
+    }
+    let parent = old.rfind('/').map(|i| old[..i].to_string()).unwrap_or_default();
+    let new_full = if parent.is_empty() {
+        new_name.clone()
+    } else {
+        format!("{parent}/{new_name}")
+    };
+    if new_full == old {
+        return Ok("Name unchanged".into());
+    }
+
+    if kind == Kind::Zip {
+        rename_zip(archive, &old, &new_full)?;
+        return Ok(format!("Renamed to {new_name}"));
+    }
+
+    rewrite_with(archive, kind, password, progress, |work| {
+        let from = safe_join(work, &old).ok_or("Invalid path")?;
+        let to = safe_join(work, &new_full).ok_or("Invalid name")?;
+        if to.exists() {
+            return Err(format!("\"{new_name}\" already exists"));
+        }
+        fs::rename(&from, &to).map_err(es)
+    })?;
+    Ok(format!("Renamed to {new_name}{}", password_note(password)))
+}
+
+/// ZIP: copy every entry as-is into a new file, renaming the matching ones.
+fn rename_zip(archive: &Path, old: &str, new_full: &str) -> Result<(), String> {
+    let fname = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or("Invalid archive path")?;
+    let tmp = archive.with_file_name(format!(".{fname}.rustarc-tmp"));
+    let _ = fs::remove_file(&tmp);
+
+    let result = (|| -> Result<(), String> {
+        let mut src = zip::ZipArchive::new(File::open(archive).map_err(es)?).map_err(es)?;
+        for i in 0..src.len() {
+            let f = src.by_index_raw(i).map_err(es)?;
+            if norm(f.name()).trim_end_matches('/') == new_full {
+                return Err(format!("\"{new_full}\" already exists"));
+            }
+        }
+        let mut w = zip::ZipWriter::new(File::create(&tmp).map_err(es)?);
+        let old_prefix = format!("{old}/");
+        for i in 0..src.len() {
+            let f = src.by_index_raw(i).map_err(es)?;
+            let name = norm(f.name());
+            let trimmed = name.trim_end_matches('/');
+            let slash = if name.ends_with('/') { "/" } else { "" };
+            let renamed = if trimmed == old {
+                Some(format!("{new_full}{slash}"))
+            } else if let Some(rest) = trimmed.strip_prefix(&old_prefix) {
+                Some(format!("{new_full}/{rest}{slash}"))
+            } else {
+                None
+            };
+            match renamed {
+                Some(n) => w.raw_copy_file_rename(f, n).map_err(es)?,
+                None => w.raw_copy_file(f).map_err(es)?,
+            }
+        }
+        w.finish().map_err(es)?;
+        fs::rename(&tmp, archive).map_err(es)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Paste items (cut = move, otherwise copy) into `dest_folder` ("" = top level) of the same archive.
+pub fn paste_items(
+    archive: &Path,
+    items: &[String],
+    dest_folder: &str,
+    cut: bool,
+    password: &str,
+    progress: Progress,
+) -> Result<String, String> {
+    let fmt = Format::detect(archive).ok_or("Unsupported archive format")?;
+    let kind = kind_of(fmt).ok_or("Pasting is not supported for this archive type")?;
+    let dest_folder = dest_folder.trim_matches('/').to_string();
+
+    rewrite_with(archive, kind, password, progress, |work| {
+        let dest_dir = if dest_folder.is_empty() {
+            work.to_path_buf()
+        } else {
+            safe_join(work, &dest_folder).ok_or("Invalid folder")?
+        };
+        fs::create_dir_all(&dest_dir).map_err(es)?;
+        for item in items {
+            let from = safe_join(work, item).ok_or("Invalid path")?;
+            if !from.exists() {
+                continue;
+            }
+            let name = from
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or("Invalid name")?;
+            if dest_dir.starts_with(&from) && dest_dir != from.parent().unwrap_or(work) {
+                return Err("Cannot paste a folder into itself".into());
+            }
+            progress(format!("{} {name}", if cut { "Moving" } else { "Copying" }));
+            if cut {
+                let to = dest_dir.join(&name);
+                if to == from {
+                    continue;
+                }
+                if to.exists() {
+                    return Err(format!("\"{name}\" already exists in the target folder"));
+                }
+                fs::rename(&from, &to).map_err(es)?;
+            } else {
+                copy_recursive(&from, &unique_path(&dest_dir, &name)).map_err(es)?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(format!(
+        "{} {} item(s){}",
+        if cut { "Moved" } else { "Copied" },
+        items.len(),
+        password_note(password)
+    ))
+}
+
+fn file_uri(p: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::from("file://");
+    for &b in p.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// "Open With…": ask the desktop portal to show its application chooser. Falls back to the
+/// default application when the portal (or `gdbus`) is not available.
+pub fn open_with_chooser(path: &Path) -> Result<String, String> {
+    use std::process::Command;
+    let uri = file_uri(path);
+    let shown = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.portal.Desktop",
+            "--object-path",
+            "/org/freedesktop/portal/desktop",
+            "--method",
+            "org.freedesktop.portal.OpenURI.OpenURI",
+            "",
+            &uri,
+            "{'ask': <true>}",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if shown {
+        return Ok("Choose an application…".into());
+    }
+    Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map_err(|e| format!("Could not start xdg-open: {e}"))?;
+    Ok("The \"Open With\" chooser is not available here; opened with the default application.".into())
+}
