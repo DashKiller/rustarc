@@ -19,6 +19,114 @@ fn es<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+// ─────────────────────────── split archives (.001, .002, …) ───────────────────────────
+
+trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+/// The parts of a split archive: `name.ext.001`, `name.ext.002`, … Works no matter which
+/// part was opened. Returns None if the name is not numbered or `.001` does not exist.
+fn split_parts(path: &Path) -> Option<Vec<PathBuf>> {
+    let name = path.file_name()?.to_str()?;
+    let (stem, num) = name.rsplit_once('.')?;
+    if num.len() < 3 || !num.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let width = num.len();
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut parts = Vec::new();
+    let mut i = 1;
+    loop {
+        let candidate = dir.join(format!("{stem}.{i:0width$}"));
+        if candidate.is_file() {
+            parts.push(candidate);
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
+    }
+}
+
+/// Is this file part of a split archive? (Split archives are read-only here.)
+pub fn is_split(path: &Path) -> bool {
+    split_parts(path).is_some()
+}
+
+/// Several files presented as one continuous, seekable file.
+struct MultiReader {
+    files: Vec<File>,
+    ends: Vec<u64>, // cumulative end offset of every part
+    pos: u64,
+    total: u64,
+}
+
+impl MultiReader {
+    fn open(parts: &[PathBuf]) -> io::Result<Self> {
+        let (mut files, mut ends, mut total) = (Vec::new(), Vec::new(), 0u64);
+        for p in parts {
+            let f = File::open(p)?;
+            total += f.metadata()?.len();
+            ends.push(total);
+            files.push(f);
+        }
+        Ok(Self { files, ends, pos: 0, total })
+    }
+}
+
+impl Read for MultiReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.total || buf.is_empty() {
+            return Ok(0);
+        }
+        let idx = self.ends.partition_point(|&e| e <= self.pos);
+        let start = if idx == 0 { 0 } else { self.ends[idx - 1] };
+        let remain = (self.ends[idx] - self.pos) as usize;
+        let f = &mut self.files[idx];
+        f.seek(SeekFrom::Start(self.pos - start))?;
+        let take = buf.len().min(remain);
+        let n = f.read(&mut buf[..take])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for MultiReader {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let new = match from {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::End(d) => self.total as i64 + d,
+            SeekFrom::Current(d) => self.pos as i64 + d,
+        };
+        if new < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek before start"));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+/// Open a file for random access, joining split parts transparently. Also returns its length.
+fn open_seekable(path: &Path) -> io::Result<(Box<dyn ReadSeek>, u64)> {
+    if let Some(parts) = split_parts(path) {
+        let m = MultiReader::open(&parts)?;
+        let len = m.total;
+        return Ok((Box::new(BufReader::with_capacity(1 << 20, m)), len));
+    }
+    let f = File::open(path)?;
+    let len = f.metadata()?.len();
+    Ok((Box::new(BufReader::new(f)), len))
+}
+
+fn open_7z(path: &Path, password: &str) -> Result<SevenZReader<Box<dyn ReadSeek>>, String> {
+    let (reader, len) = open_seekable(path).map_err(es)?;
+    SevenZReader::new(reader, len, pw(password)).map_err(es)
+}
+
 // ───────────────────────────── formats ─────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -60,6 +168,12 @@ impl Format {
 
     /// Detect by magic bytes (so misnamed files still work), then by extension.
     pub fn detect(path: &Path) -> Option<Format> {
+        // opened `.002`, `.003`, …: judge the archive by its first part
+        if let Some(parts) = split_parts(path) {
+            if parts[0] != path {
+                return Format::detect(&parts[0]);
+            }
+        }
         let mut magic = [0u8; 8];
         let n = File::open(path)
             .ok()
@@ -118,7 +232,7 @@ fn is_tar_stream(r: &mut dyn Read) -> bool {
 
 /// Open a file through the matching decompressor.
 fn open_reader(path: &Path, comp: Comp) -> io::Result<Box<dyn Read>> {
-    let file = File::open(path)?;
+    let (file, _) = open_seekable(path)?;
     Ok(match comp {
         Comp::None => Box::new(BufReader::new(file)),
         Comp::Gz => Box::new(flate2::read::MultiGzDecoder::new(BufReader::new(file))),
@@ -296,7 +410,7 @@ pub fn list(path: &Path, password: &str) -> Result<(Format, Vec<Entry>), String>
 }
 
 fn list_7z(path: &Path, password: &str) -> Result<Vec<Entry>, String> {
-    let reader = SevenZReader::open(path, pw(password)).map_err(es)?;
+    let reader = open_7z(path, password)?;
     Ok(reader
         .archive()
         .files
@@ -558,7 +672,7 @@ fn rar4_walk(f: &mut File, out: &mut HashMap<String, RarMeta>) -> io::Result<()>
 }
 
 fn list_zip(path: &Path) -> Result<Vec<Entry>, String> {
-    let mut z = zip::ZipArchive::new(File::open(path).map_err(es)?).map_err(es)?;
+    let mut z = zip::ZipArchive::new(open_seekable(path).map_err(es)?.0).map_err(es)?;
     let mut out = Vec::with_capacity(z.len());
     for i in 0..z.len() {
         // by_index_raw does not need the password
@@ -662,8 +776,18 @@ fn extract_7z(
     password: &str,
     progress: Progress,
 ) -> Result<usize, String> {
-    let mut reader = SevenZReader::open(path, pw(password)).map_err(es)?;
+    let mut reader = open_7z(path, password)?;
     let mut count = 0usize;
+    // With a selection we know how many entries to expect (the file list is in the header),
+    // so a solid archive can stop decompressing once the last one is done.
+    let expected = sel.map(|_| {
+        reader
+            .archive()
+            .files
+            .iter()
+            .filter(|f| wanted(&norm(f.name()), sel))
+            .count()
+    });
     reader
         .for_each_entries(|entry, data| {
             let name = norm(entry.name());
@@ -686,6 +810,11 @@ fn extract_7z(
                 io::copy(data, &mut out)?;
             }
             count += 1;
+            if let Some(n) = expected {
+                if count >= n {
+                    return Ok(false); // everything wanted is out; skip the rest of the archive
+                }
+            }
             Ok(true)
         })
         .map_err(es)?;
@@ -738,7 +867,7 @@ fn extract_zip(
     password: &str,
     progress: Progress,
 ) -> Result<usize, String> {
-    let mut z = zip::ZipArchive::new(File::open(path).map_err(es)?).map_err(es)?;
+    let mut z = zip::ZipArchive::new(open_seekable(path).map_err(es)?.0).map_err(es)?;
     let mut count = 0usize;
     for i in 0..z.len() {
         let res = if password.is_empty() {
@@ -808,7 +937,7 @@ fn extract_tar(
 pub fn test(path: &Path, password: &str, progress: Progress) -> Result<String, String> {
     let n = match Format::detect(path).ok_or("Unsupported archive format")? {
         Format::SevenZ => {
-            let mut reader = SevenZReader::open(path, pw(password)).map_err(es)?;
+            let mut reader = open_7z(path, password)?;
             let mut n = 0usize;
             reader
                 .for_each_entries(|entry, data| {
@@ -832,7 +961,7 @@ pub fn test(path: &Path, password: &str, progress: Progress) -> Result<String, S
             n
         }
         Format::Zip => {
-            let mut z = zip::ZipArchive::new(File::open(path).map_err(es)?).map_err(es)?;
+            let mut z = zip::ZipArchive::new(open_seekable(path).map_err(es)?.0).map_err(es)?;
             for i in 0..z.len() {
                 let res = if password.is_empty() {
                     z.by_index(i)
@@ -935,6 +1064,11 @@ fn kind_of(fmt: Format) -> Option<Kind> {
 /// Can files be added to archives of this format? (RAR cannot be written.)
 pub fn can_add(fmt: Format) -> bool {
     kind_of(fmt).is_some()
+}
+
+/// Can the archive at `path` be modified in place? (Not when it is split into parts.)
+pub fn can_modify(path: &Path, fmt: Format) -> bool {
+    can_add(fmt) && !is_split(path)
 }
 
 fn copy_recursive(src: &Path, dst: &Path) -> io::Result<()> {

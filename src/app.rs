@@ -440,7 +440,7 @@ impl App {
                 "Archives",
                 &[
                     "7z", "rar", "zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst",
-                    "tzst", "jar", "apk", "cbz",
+                    "tzst", "jar", "apk", "cbz", "001",
                 ],
             )
             .pick_file()
@@ -549,7 +549,18 @@ impl App {
             return;
         }
 
-        let state = DragState::new();
+        // Where the files will end up is known now, so the drop target can be answered at once.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dest = temp_dir().join(format!("drag-{nanos}"));
+        let planned: Vec<PathBuf> = tops
+            .iter()
+            .map(|t| dest.join(t.rsplit('/').next().unwrap_or(t)))
+            .collect();
+
+        let state = DragState::new(planned);
         let started = self
             .drag
             .lock()
@@ -560,20 +571,20 @@ impl App {
             self.status = "Dragging files out is only supported on Wayland.".into();
             return;
         }
-        self.status = format!("Dragging {} item(s)…", tops.len());
+        self.status = format!("Dragging {} item(s) – large files can take a moment to extract before they can be dropped.", tops.len());
 
         let pw = self.password.clone();
         thread::spawn(move || {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let dest = temp_dir().join(format!("drag-{nanos}"));
             let sel: HashSet<String> = tops.iter().cloned().collect();
-            let result = archive::extract(&path, &dest, Some(&sel), &pw, &|_| {}).map(|_| {
-                tops.iter()
-                    .map(|t| dest.join(t.rsplit('/').next().unwrap_or(t)))
-                    .collect::<Vec<PathBuf>>()
+            // Extract into a hidden staging folder, then move the finished items into place,
+            // so a drop target never sees a half-written file.
+            let staging = dest.join(".partial");
+            let result = archive::extract(&path, &staging, Some(&sel), &pw, &|_| {}).and_then(|_| {
+                for t in &tops {
+                    let name = t.rsplit('/').next().unwrap_or(t);
+                    std::fs::rename(staging.join(name), dest.join(name)).map_err(|e| e.to_string())?;
+                }
+                Ok(())
             });
             state.finish(result);
         });
@@ -591,6 +602,14 @@ impl App {
             })
             .cloned()
             .collect()
+    }
+
+    /// Add / remove / rename / paste are possible for this archive?
+    fn can_modify(&self) -> bool {
+        match (&self.path, self.format) {
+            (Some(p), Some(f)) => archive::can_modify(p, f),
+            _ => false,
+        }
     }
 
     fn begin_rename(&mut self) {
@@ -684,7 +703,7 @@ impl App {
     /// one folder is selected, otherwise to the top level.
     fn add_files(&mut self, ctx: &egui::Context, folders: bool) {
         let Some(path) = self.path.clone() else { return };
-        if !self.format.map(archive::can_add).unwrap_or(false) {
+        if !self.can_modify() {
             return;
         }
         let dialog = rfd::FileDialog::new().set_title("Add to archive");
@@ -954,7 +973,7 @@ impl eframe::App for App {
 
         let has = self.path.is_some() && !self.busy;
         let has_file_sel = has && !self.selected_files().is_empty();
-        let can_add = has && self.format.map(archive::can_add).unwrap_or(false);
+        let can_add = has && self.can_modify();
 
         // Shortcuts shown in the context menu
         if !ctx.wants_keyboard_input() && has {

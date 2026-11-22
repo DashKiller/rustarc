@@ -44,34 +44,47 @@ const URI_LIST: &str = "text/uri-list";
 
 // ───────────────────────── drag OUT (app -> file manager) ─────────────────────────
 
-/// Shared between the UI (which extracts files) and the Wayland thread (which hands the
-/// file list to the drop target once it is ready).
+/// Shared between the UI (which extracts files in the background) and the Wayland thread
+/// (which answers the drop target). Drop targets such as Dolphin/Plasma read the file list
+/// once, while the pointer hovers, and reuse it for the drop, so the list is only handed
+/// over once the files really exist on disk.
 pub struct DragState {
-    result: Mutex<Option<Result<Vec<PathBuf>, String>>>,
+    paths: Vec<PathBuf>,
+    done: Mutex<Option<Result<(), String>>>,
     cv: Condvar,
 }
 
 impl DragState {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self { result: Mutex::new(None), cv: Condvar::new() })
+    pub fn new(paths: Vec<PathBuf>) -> Arc<Self> {
+        Arc::new(Self {
+            paths,
+            done: Mutex::new(None),
+            cv: Condvar::new(),
+        })
     }
 
-    /// Called by the extraction thread when the files exist on disk.
-    pub fn finish(&self, r: Result<Vec<PathBuf>, String>) {
-        *self.result.lock().unwrap() = Some(r);
+    /// Called by the extraction thread when it is finished.
+    pub fn finish(&self, r: Result<(), String>) {
+        *self.done.lock().unwrap() = Some(r);
         self.cv.notify_all();
     }
 
-    /// Blocks until extraction is done, then returns the text/uri-list payload.
     fn uri_list(&self) -> String {
-        let mut guard = self.result.lock().unwrap();
+        self.paths.iter().map(|p| format!("file://{}\r\n", percent_encode(p))).collect()
+    }
+
+    /// None while extraction is still running, otherwise whether it succeeded.
+    fn status(&self) -> Option<bool> {
+        self.done.lock().unwrap().as_ref().map(|r| r.is_ok())
+    }
+
+    /// Blocks until extraction is finished; true if it succeeded.
+    fn wait_done(&self) -> bool {
+        let mut guard = self.done.lock().unwrap();
         while guard.is_none() {
             guard = self.cv.wait(guard).unwrap();
         }
-        match guard.as_ref().unwrap() {
-            Ok(paths) => paths.iter().map(|p| format!("file://{}\r\n", percent_encode(p))).collect(),
-            Err(_) => String::new(),
-        }
+        guard.as_ref().map(|r| r.is_ok()).unwrap_or(false)
     }
 }
 
@@ -249,10 +262,25 @@ impl Dispatch<WlDataSource, Arc<DragState>> for State {
         match event {
             wl_data_source::Event::Send { mime_type, fd } => {
                 if mime_type == URI_LIST {
-                    // Waits until the files are extracted, then writes the list.
                     let uris = data.uri_list();
-                    let mut file = File::from(fd);
-                    let _ = file.write_all(uris.as_bytes());
+                    match data.status() {
+                        // extraction failed: hand over nothing
+                        Some(false) => {}
+                        // files are ready: answer right away
+                        Some(true) => {
+                            let _ = File::from(fd).write_all(uris.as_bytes());
+                        }
+                        // still extracting: answer once it is done, from a helper thread so
+                        // the Wayland thread keeps running
+                        None => {
+                            let data = data.clone();
+                            thread::spawn(move || {
+                                if data.wait_done() {
+                                    let _ = File::from(fd).write_all(uris.as_bytes());
+                                }
+                            });
+                        }
+                    }
                 }
             }
             wl_data_source::Event::Cancelled | wl_data_source::Event::DndFinished => {
