@@ -1439,22 +1439,22 @@ impl eframe::App for App {
                         if resp.secondary_clicked() {
                             right_clicked = Some(ni);
                         }
-                        if !n.is_dir {
+                        {
                             resp.clone().context_menu(|ui| {
                                 // plain helper: returns true when clicked (so it holds no borrow of `menu_action`)
                                 let item = |ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool| -> bool {
                                     ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut))
                                         .clicked()
                                 };
-                                if item(ui, "Preview", "Ctrl+P", m_file_sel) {
+                                if item(ui, "Preview", "Ctrl+P", m_file_sel && !n.is_dir) {
                                     menu_action = Some(MenuAction::Preview);
                                     ui.close_menu();
                                 }
-                                if item(ui, "Open in External Application", "", m_file_sel) {
+                                if item(ui, "Open in External Application", "", m_file_sel && !n.is_dir) {
                                     menu_action = Some(MenuAction::OpenExternal);
                                     ui.close_menu();
                                 }
-                                if item(ui, "Open With…", "", m_file_sel) {
+                                if item(ui, "Open With…", "", m_file_sel && !n.is_dir) {
                                     menu_action = Some(MenuAction::OpenWith);
                                     ui.close_menu();
                                 }
