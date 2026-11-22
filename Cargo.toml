@@ -17,6 +17,8 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 raw-window-handle = "0.6"
 # Local-time dates in the file list
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# D-Bus service for KDE-style drag extraction (same protocol as Ark)
+zbus = "5"
 # ZIP, TAR and the compressors used with TAR
 zip = "2.2"
 tar = "0.4"

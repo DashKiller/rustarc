@@ -278,6 +278,10 @@ pub struct App {
     dnd_rx: Receiver<PathBuf>,
     dnd_hovering: Arc<AtomicBool>,
     drag: SharedDrag,
+    /// destination folders sent by the drop target (KDE drag-extract protocol)
+    extract_rx: Receiver<PathBuf>,
+    /// what the current drag carries: (archive, top-level items)
+    drag_job: Option<(PathBuf, Vec<String>)>,
 }
 
 pub fn temp_dir() -> PathBuf {
@@ -290,6 +294,7 @@ impl App {
         dnd_rx: Receiver<PathBuf>,
         dnd_hovering: Arc<AtomicBool>,
         drag: SharedDrag,
+        extract_rx: Receiver<PathBuf>,
     ) -> Self {
         let (tx, rx) = channel();
         Self {
@@ -325,6 +330,8 @@ impl App {
             dnd_rx,
             dnd_hovering,
             drag,
+            extract_rx,
+            drag_job: None,
         }
     }
 
@@ -529,8 +536,8 @@ impl App {
         });
     }
 
-    /// Drag the selected items out of the window; they are extracted to a temp folder and
-    /// handed to whatever the user drops them on.
+    /// Drag the selected items out of the window. On KDE the drop target tells us where to
+    /// extract them (like Ark); otherwise they are extracted to a temp folder first.
     fn begin_drag_out(&mut self) {
         let Some(path) = self.path.clone() else { return };
         // only top-level selections: a selected folder already covers its children
@@ -549,7 +556,7 @@ impl App {
             return;
         }
 
-        // Where the files will end up is known now, so the drop target can be answered at once.
+        // Only used in file-list mode: where the extracted files will be placed.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -565,29 +572,49 @@ impl App {
             .drag
             .lock()
             .ok()
-            .and_then(|g| g.as_ref().map(|h| h.start(state.clone())))
-            .unwrap_or(false);
-        if !started {
+            .and_then(|g| g.as_ref().and_then(|h| h.start(state.clone())));
+        let Some(uri_mode) = started else {
             self.status = "Dragging files out is only supported on Wayland.".into();
             return;
-        }
-        self.status = format!("Dragging {} item(s) – large files can take a moment to extract before they can be dropped.", tops.len());
+        };
 
-        let pw = self.password.clone();
-        thread::spawn(move || {
-            let sel: HashSet<String> = tops.iter().cloned().collect();
-            // Extract into a hidden staging folder, then move the finished items into place,
-            // so a drop target never sees a half-written file.
-            let staging = dest.join(".partial");
-            let result = archive::extract(&path, &staging, Some(&sel), &pw, &|_| {}).and_then(|_| {
-                for t in &tops {
-                    let name = t.rsplit('/').next().unwrap_or(t);
-                    std::fs::rename(staging.join(name), dest.join(name)).map_err(|e| e.to_string())?;
-                }
-                Ok(())
+        if uri_mode {
+            // Plain file-list drag (no D-Bus): the files must exist before the target can be
+            // answered, so extract them now.
+            self.status = format!("Dragging {} item(s) – large files can take a moment.", tops.len());
+            let pw = self.password.clone();
+            thread::spawn(move || {
+                let sel: HashSet<String> = tops.iter().cloned().collect();
+                // staging folder: a target never sees a half-written file
+                let staging = dest.join(".partial");
+                let result = archive::extract(&path, &staging, Some(&sel), &pw, &|_| {}).and_then(|_| {
+                    for t in &tops {
+                        let name = t.rsplit('/').next().unwrap_or(t);
+                        std::fs::rename(staging.join(name), dest.join(name)).map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                });
+                state.finish(result);
             });
-            state.finish(result);
-        });
+        } else {
+            // KDE protocol: nothing is extracted now. When the item is dropped, the file
+            // manager tells us the destination folder and we extract straight into it.
+            self.status = format!("Dragging {} item(s)…", tops.len());
+            self.drag_job = Some((path, tops));
+        }
+    }
+
+    /// The drop target (KDE file manager) told us where the dragged items should go.
+    fn drag_extract_to(&mut self, ctx: &egui::Context, dest: PathBuf) {
+        let Some((path, items)) = self.drag_job.take() else { return };
+        if self.busy {
+            self.status = "Busy – drop the items again in a moment.".into();
+            self.drag_job = Some((path, items));
+            return;
+        }
+        let sel: HashSet<String> = items.into_iter().collect();
+        let pw = self.password.clone();
+        self.run(ctx, "Extracting…", move |p| archive::extract(&path, &dest, Some(&sel), &pw, p));
     }
 
     /// Selected items without those already covered by a selected parent folder.
@@ -944,6 +971,9 @@ impl eframe::App for App {
         let mut dropped = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
         while let Ok(p) = self.dnd_rx.try_recv() {
             dropped = Some(p);
+        }
+        while let Ok(dest) = self.extract_rx.try_recv() {
+            self.drag_extract_to(ctx, dest);
         }
         if let Some(p) = dropped {
             self.open(ctx, p);

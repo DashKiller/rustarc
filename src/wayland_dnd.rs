@@ -23,6 +23,7 @@ use std::{
 };
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+use zbus::{blocking::connection::Builder as BusBuilder, interface};
 use wayland_client::{
     backend::{Backend, ObjectId},
     delegate_noop, event_created_child,
@@ -41,6 +42,37 @@ use wayland_client::{
 };
 
 const URI_LIST: &str = "text/uri-list";
+
+// KDE's drag-extract protocol (used by Ark): the drag carries no files, only the name of a
+// D-Bus service. When dropped, the file manager (KIO) calls
+// `org.kde.ark.DndExtract.extractSelectedFilesTo(dir)` on it and we extract straight there.
+const ARK_SERVICE: &str = "application/x-kde-ark-dndextract-service";
+const ARK_PATH: &str = "application/x-kde-ark-dndextract-path";
+const DND_PATH: &str = "/DndExtract";
+
+/// Also offer a plain file list (needs the files to be extracted before the drag can be
+/// answered, so it is slow). Used when D-Bus is unavailable, or with RUSTARC_DRAG_URIS=1.
+fn uri_fallback() -> bool {
+    std::env::var_os("RUSTARC_DRAG_URIS").is_some()
+}
+
+struct DndExtract {
+    tx: Sender<PathBuf>,
+    ctx: eframe::egui::Context,
+}
+
+#[interface(name = "org.kde.ark.DndExtract")]
+impl DndExtract {
+    #[zbus(name = "extractSelectedFilesTo")]
+    fn extract_selected_files_to(&self, path: String) {
+        let dest = match path.strip_prefix("file://") {
+            Some(rest) => PathBuf::from(percent_decode(rest.find('/').map(|i| &rest[i..]).unwrap_or(rest))),
+            None => PathBuf::from(path),
+        };
+        let _ = self.tx.send(dest);
+        self.ctx.request_repaint();
+    }
+}
 
 // ───────────────────────── drag OUT (app -> file manager) ─────────────────────────
 
@@ -108,24 +140,34 @@ pub struct DragHandle {
     device: WlDataDevice,
     surface: WlSurface,
     serial: Arc<AtomicU32>,
+    /// the D-Bus drag-extract service is up
+    has_dbus: bool,
 }
 
 impl DragHandle {
-    /// Start dragging. `state` is completed later with the extracted file paths.
-    /// Returns false if no valid button-press serial is known yet.
-    pub fn start(&self, state: Arc<DragState>) -> bool {
+    /// Start dragging. Returns None if no drag could be started (no button press seen yet),
+    /// otherwise whether the caller must extract the files up front (file-list mode).
+    /// In the normal D-Bus mode nothing is extracted until the drop target asks for it.
+    pub fn start(&self, state: Arc<DragState>) -> Option<bool> {
         let serial = self.serial.load(Ordering::Relaxed);
         if serial == 0 {
-            return false;
+            return None;
         }
+        let uri_mode = !self.has_dbus || uri_fallback();
         let source = self.manager.create_data_source(&self.qh, state);
-        source.offer(URI_LIST.to_string());
+        if self.has_dbus {
+            source.offer(ARK_SERVICE.to_string());
+            source.offer(ARK_PATH.to_string());
+        }
+        if uri_mode {
+            source.offer(URI_LIST.to_string());
+        }
         if self.manager.version() >= 3 {
             source.set_actions(DndAction::Copy);
         }
         self.device.start_drag(Some(&source), &self.surface, None, serial);
         let _ = self.conn.flush();
-        true
+        Some(uri_mode)
     }
 }
 
@@ -139,6 +181,7 @@ pub fn start(
     tx: Sender<PathBuf>,
     hovering: Arc<AtomicBool>,
     drag: SharedDrag,
+    extract_tx: Sender<PathBuf>,
 ) {
     let Ok(handle) = cc.display_handle() else { return };
     let RawDisplayHandle::Wayland(h) = handle.as_raw() else { return };
@@ -150,7 +193,7 @@ pub fn start(
     let ctx = cc.egui_ctx.clone();
 
     thread::spawn(move || {
-        if let Err(e) = run(display, surface, tx, hovering, drag, ctx) {
+        if let Err(e) = run(display, surface, tx, hovering, drag, ctx, extract_tx) {
             eprintln!("rustarc: Wayland drag-and-drop unavailable: {e}");
         }
     });
@@ -162,6 +205,8 @@ struct State {
     tx: Sender<PathBuf>,
     hovering: Arc<AtomicBool>,
     serial: Arc<AtomicU32>,
+    /// our D-Bus unique name, handed to drop targets that speak the Ark protocol
+    service: String,
     offers: HashMap<ObjectId, Vec<String>>,
     dnd_offer: Option<WlDataOffer>,
 }
@@ -173,6 +218,7 @@ fn run(
     hovering: Arc<AtomicBool>,
     drag: SharedDrag,
     ctx: eframe::egui::Context,
+    extract_tx: Sender<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: the pointers come from winit's live wl_display / wl_surface and stay valid
     // for the lifetime of the application window.
@@ -186,6 +232,18 @@ fn run(
     let device = manager.get_data_device(&seat, &qh, ());
     // We only listen to pointer buttons to learn the serial a drag must be started with.
     let _pointer = seat.get_pointer(&qh, ());
+
+    // D-Bus service the file manager calls when something dragged from us is dropped.
+    let bus = BusBuilder::session()
+        .and_then(|b| b.serve_at(DND_PATH, DndExtract { tx: extract_tx, ctx: ctx.clone() }))
+        .and_then(|b| b.build());
+    let (service, _bus) = match bus {
+        Ok(c) => (c.unique_name().map(|n| n.to_string()).unwrap_or_default(), Some(c)),
+        Err(e) => {
+            eprintln!("rustarc: D-Bus drag extraction unavailable ({e}); using file lists instead");
+            (String::new(), None)
+        }
+    };
 
     let serial = Arc::new(AtomicU32::new(0));
 
@@ -201,6 +259,7 @@ fn run(
                 device: device.clone(),
                 surface: wl_surface,
                 serial: serial.clone(),
+                has_dbus: !service.is_empty(),
             });
         }
     }
@@ -211,6 +270,7 @@ fn run(
         tx,
         hovering,
         serial,
+        service,
         offers: HashMap::new(),
         dnd_offer: None,
     };
@@ -252,7 +312,7 @@ impl Dispatch<WlPointer, ()> for State {
 
 impl Dispatch<WlDataSource, Arc<DragState>> for State {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         source: &WlDataSource,
         event: wl_data_source::Event,
         data: &Arc<DragState>,
@@ -261,7 +321,11 @@ impl Dispatch<WlDataSource, Arc<DragState>> for State {
     ) {
         match event {
             wl_data_source::Event::Send { mime_type, fd } => {
-                if mime_type == URI_LIST {
+                if mime_type == ARK_SERVICE {
+                    let _ = File::from(fd).write_all(state.service.as_bytes());
+                } else if mime_type == ARK_PATH {
+                    let _ = File::from(fd).write_all(DND_PATH.as_bytes());
+                } else if mime_type == URI_LIST {
                     let uris = data.uri_list();
                     match data.status() {
                         // extraction failed: hand over nothing

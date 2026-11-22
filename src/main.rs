@@ -31,8 +31,9 @@ fn main() -> eframe::Result<()> {
             let (tx, rx) = channel();
             let hovering = Arc::new(AtomicBool::new(false));
             let drag: wayland_dnd::SharedDrag = Arc::new(Mutex::new(None));
-            wayland_dnd::start(cc, tx, hovering.clone(), drag.clone());
-            Ok(Box::new(app::App::new(first_arg, rx, hovering, drag)))
+            let (extract_tx, extract_rx) = channel();
+            wayland_dnd::start(cc, tx, hovering.clone(), drag.clone(), extract_tx);
+            Ok(Box::new(app::App::new(first_arg, rx, hovering, drag, extract_rx)))
         }),
     );
     // remove files extracted for previews / drag-out
