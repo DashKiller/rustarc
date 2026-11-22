@@ -1330,12 +1330,21 @@ impl eframe::App for App {
             // Only allow horizontal scrolling when the columns genuinely cannot fit.
             let needs_h_scroll = used + NAME_MIN > avail_w + 0.5;
 
+            let row_w = name_w + used;
+
             ui.push_id(self.table_gen, |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.spacing_mut().item_spacing.y = 0.0;
+            ui.visuals_mut().widgets.hovered.bg_fill = Color32::TRANSPARENT;
+            ui.visuals_mut().widgets.hovered.weak_bg_fill = Color32::TRANSPARENT;
             egui::ScrollArea::new([needs_h_scroll, false]).auto_shrink([false, false]).show(ui, |ui| {
+            // Slot for the row backgrounds, reserved *before* any table content so that whatever
+            // is drawn into it ends up underneath all cell text.
+            let bg_idx = ui.painter().add(egui::Shape::Noop);
+            let mut row_infos: Vec<(Rect, bool, bool, usize)> = Vec::new(); // rect, odd, selected, depth
+            let mut header_bottom = f32::NEG_INFINITY;
             let mut table = TableBuilder::new(ui)
-                .striped(true)
+                .striped(false)
                 .sense(Sense::click_and_drag())
                 .column(Column::exact(name_w).clip(true));
             let mut headers: Vec<&str> = vec!["Name"];
@@ -1349,7 +1358,7 @@ impl eframe::App for App {
             table
                 .header(26.0, |mut h| {
                     for (i, t) in headers.iter().enumerate() {
-                        h.col(|ui| {
+                        let (hrect, _) = h.col(|ui| {
                             let resp = ui.interact(ui.max_rect(), ui.id().with(("col_header", i)), Sense::click());
                             resp.context_menu(|ui| {
                                 for k in 0..NCOLS {
@@ -1368,15 +1377,24 @@ impl eframe::App for App {
                                 p.vline(rect.right() - 0.5, rect.y_range(), stroke);
                             }
                         });
+                        header_bottom = header_bottom.max(hrect.bottom());
                     }
                 })
                 .body(|body| {
                     body.rows(29.0, rows.len(), |mut row| {
                         let (ni, depth) = rows[row.index()];
                         let n = &self.tree.nodes[ni];
-                        row.set_selected(self.selected.contains(&n.full));
+                        let is_selected = self.selected.contains(&n.full);
+                        let odd_row = row.index() % 2 == 1;
 
                         row.col(|ui| {
+                            let cell = ui.max_rect();
+                            row_infos.push((
+                                Rect::from_min_size(cell.min, Vec2::new(row_w, cell.height())),
+                                odd_row,
+                                is_selected,
+                                depth,
+                            ));
                             ui.horizontal_centered(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 ui.add_space(8.0 + depth as f32 * 18.0);
@@ -1488,6 +1506,60 @@ impl eframe::App for App {
                         }
                     });
                 });
+            // Row backgrounds (stripes, hover, selection) span every column and sit underneath
+            // the cell content, in the slot reserved above.
+            {
+                let view = ui.clip_rect();
+                let body_clip = Rect::from_min_max(
+                    Pos2::new(view.left(), header_bottom.max(view.top())),
+                    view.max,
+                );
+                let pointer = ui
+                    .input(|i| i.pointer.hover_pos())
+                    .filter(|pos| ui.ctx().layer_id_at(*pos) == Some(ui.layer_id()));
+                let accent = visuals.selection.bg_fill;
+                let mut shapes: Vec<egui::Shape> = Vec::new();
+                for (r, odd, sel, depth) in &row_infos {
+                    let vis_rect = r.intersect(body_clip);
+                    if vis_rect.height() <= 0.0 {
+                        continue;
+                    }
+                    if *odd {
+                        shapes.push(egui::Shape::rect_filled(vis_rect, 0.0, visuals.faint_bg_color));
+                    }
+                    // like Ark: rounded, inset, thin outline, starting at the icon (the
+                    // expander arrow stays outside the highlight)
+                    let left = r.left() + 21.0 + *depth as f32 * 18.0;
+                    let right = r.right() - 4.0;
+                    if right <= left {
+                        continue;
+                    }
+                    let hl = Rect::from_min_max(
+                        Pos2::new(left, r.top() + 1.0),
+                        Pos2::new(right, r.bottom() - 1.0),
+                    )
+                    .intersect(body_clip);
+                    if hl.height() <= 0.0 {
+                        continue;
+                    }
+                    if *sel {
+                        shapes.push(egui::Shape::rect_filled(hl, 4.0, accent));
+                        shapes.push(egui::Shape::rect_stroke(
+                            hl,
+                            4.0,
+                            egui::Stroke::new(1.0_f32, Color32::from_rgb(110, 200, 245)),
+                        ));
+                    } else if pointer.map_or(false, |p| vis_rect.contains(p)) {
+                        shapes.push(egui::Shape::rect_filled(hl, 4.0, accent.gamma_multiply(0.22)));
+                        shapes.push(egui::Shape::rect_stroke(
+                            hl,
+                            4.0,
+                            egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.5)),
+                        ));
+                    }
+                }
+                ui.painter().set(bg_idx, egui::Shape::Vec(shapes));
+            }
             });
             });
             if new_cols != self.show_cols {
