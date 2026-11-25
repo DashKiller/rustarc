@@ -27,4 +27,8 @@ jobs:
       - name: Attach AppImage to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" RustArc-x86_64.AppImage --clobber
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          asset="RustArc-${tag}-linux-x86_64.AppImage"
+          mv RustArc-x86_64.AppImage "$asset"
+          gh release upload "$tag" "$asset" --clobber
