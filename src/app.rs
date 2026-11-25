@@ -1403,8 +1403,8 @@ impl eframe::App for App {
                     let r = ui.clip_rect();
                     ui.painter().rect_filled(
                         Rect::from_min_size(r.min, Vec2::new(r.width() * f, r.height())),
-                                             0.0,
-                                             Color32::from_rgba_unmultiplied(39, 174, 96, 130),
+                        0.0,
+                        Color32::from_rgba_unmultiplied(39, 174, 96, 130),
                     );
                 }
             }
@@ -1425,7 +1425,7 @@ impl eframe::App for App {
                         ui.add(
                             egui::Label::new(format!(
                                 "{sel}{folders} folder(s), {files} file(s), {}",
-                                                     human(total)
+                                human(total)
                             ))
                             .selectable(false),
                         );

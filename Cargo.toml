@@ -8,7 +8,7 @@ description = "A small WinRAR-style archive manager for Linux (7z + RAR)"
 eframe = "0.29"
 egui_extras = "0.29"
 # 7z: pure Rust, list / extract / create
-sevenz-rust = "0.6"
+sevenz-rust = { version = "0.6", features = ["aes256"] }
 # RAR: bindings to the official UnRAR library (list / extract / test only)
 unrar = "0.5"
 # Native Wayland drag-and-drop (winit has none)
