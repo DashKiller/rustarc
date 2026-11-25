@@ -24,15 +24,24 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
 
 cp target/release/rustarc "$APPDIR/usr/bin/"
 cp packaging/AppRun "$APPDIR/AppRun"
-cp packaging/io.github.dashkiller.rustarc.desktop "$APPDIR/io.github.dashkiller.rustarc.desktop"
-cp packaging/io.github.dashkiller.rustarc.desktop "$APPDIR/usr/share/applications/"
-# Basename of the root desktop file, with .desktop replaced by .appdata.xml.
-# The component id has to be reverse-DNS and must match this filename.
-cp packaging/io.github.dashkiller.rustarc.appdata.xml "$APPDIR/usr/share/metainfo/"
+
+# Use rustarc.desktop
+cp packaging/rustarc.desktop "$APPDIR/rustarc.desktop"
+cp packaging/rustarc.desktop "$APPDIR/usr/share/applications/"
+
+# Only copy appdata.xml if it exists in packaging/
+if [ -f "packaging/rustarc.appdata.xml" ]; then
+  cp packaging/rustarc.appdata.xml "$APPDIR/usr/share/metainfo/"
+fi
+
 cp packaging/rustarc.svg "$APPDIR/rustarc.svg"
 cp packaging/rustarc.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/"
-# Thumbnailers only read a PNG named .DirIcon. The SVG stays the app icon.
-cp packaging/.DirIcon "$APPDIR/.DirIcon"
+
+# Only copy .DirIcon if it exists in packaging/
+if [ -f "packaging/.DirIcon" ]; then
+  cp packaging/.DirIcon "$APPDIR/.DirIcon"
+fi
+
 chmod +x "$APPDIR/AppRun"
 
 # Bundle Noto Sans (the UI font) if it is installed here; the app falls back to egui's
