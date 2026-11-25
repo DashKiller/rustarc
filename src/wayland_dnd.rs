@@ -84,6 +84,10 @@ pub struct DragState {
     paths: Vec<PathBuf>,
     done: Mutex<Option<Result<(), String>>>,
     cv: Condvar,
+    /// the compositor reported the drag as cancelled (Escape, dropped on nothing, ...)
+    cancelled: AtomicBool,
+    /// the drop target accepted the drop and is finished with it
+    finished: AtomicBool,
 }
 
 impl DragState {
@@ -92,7 +96,17 @@ impl DragState {
             paths,
             done: Mutex::new(None),
             cv: Condvar::new(),
+            cancelled: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
         })
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
     }
 
     /// Called by the extraction thread when it is finished.
@@ -347,8 +361,15 @@ impl Dispatch<WlDataSource, Arc<DragState>> for State {
                     }
                 }
             }
-            wl_data_source::Event::Cancelled | wl_data_source::Event::DndFinished => {
+            wl_data_source::Event::Cancelled => {
+                data.cancelled.store(true, Ordering::Relaxed);
                 source.destroy();
+                state.ctx.request_repaint(); // let the UI drop its "Dragging…" status
+            }
+            wl_data_source::Event::DndFinished => {
+                data.finished.store(true, Ordering::Relaxed);
+                source.destroy();
+                state.ctx.request_repaint();
             }
             _ => {}
         }

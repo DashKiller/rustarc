@@ -290,6 +290,19 @@ enum Msg {
     Conflict(Conflict, Sender<Answer>),
 }
 
+/// An action that stopped at the password dialog and continues once a password is entered.
+enum PendingAction {
+    /// Extract all (false) or the selection (true) – asks for the folder afterwards.
+    Extract(bool),
+    /// "Open" (false) / "Open with…" (true) on the first selected file.
+    Open(bool),
+    Preview,
+    /// Just remember the password; the user starts the action again (e.g. a drag).
+    Nothing,
+    /// Items dropped onto a file manager, with the destination it gave us.
+    DragExtract(Vec<String>, PathBuf),
+}
+
 /// "File Already Exists" dialog state.
 struct ConflictUi {
     info: Conflict,
@@ -377,6 +390,8 @@ pub struct App {
     password: String,
     show_password: bool,
     pw_retry: Option<PathBuf>,
+    /// what to resume after the password dialog is confirmed
+    pending_action: Option<PendingAction>,
     preview: Option<(String, String)>,
     confirm_remove: Option<Vec<String>>,
     conflict: Option<ConflictUi>,
@@ -397,6 +412,10 @@ pub struct App {
     extract_rx: Receiver<PathBuf>,
     /// what the current drag carries: (archive, top-level items)
     drag_job: Option<(PathBuf, Vec<String>)>,
+    /// the drag that is currently in progress (to notice when it gets cancelled)
+    drag_state: Option<Arc<DragState>>,
+    /// status text from before the drag started, restored if the drag is cancelled
+    status_before_drag: String,
     /// drag-to-select: where the rubber band started (screen position)
     rubber: Option<Pos2>,
     /// selection that was there when the band started (kept when Ctrl is held)
@@ -437,6 +456,7 @@ impl App {
             password: String::new(),
             show_password: false,
             pw_retry: None,
+            pending_action: None,
             preview: None,
             confirm_remove: None,
             conflict: None,
@@ -455,6 +475,8 @@ impl App {
             drag,
             extract_rx,
             drag_job: None,
+            drag_state: None,
+            status_before_drag: String::new(),
             rubber: None,
             rubber_base: HashSet::new(),
             sort_key: 0,
@@ -603,8 +625,48 @@ impl App {
             .collect()
     }
 
+    /// If extracting `sel` needs a password we do not have yet, remember `action`, show the
+    /// password dialog and return true (the caller must stop; the action resumes on OK).
+    fn ask_password_first(
+        &mut self,
+        sel: Option<&HashSet<String>>,
+        action: PendingAction,
+    ) -> bool {
+        if !self.password.is_empty() {
+            return false;
+        }
+        let Some(path) = self.path.clone() else { return false };
+        if !archive::needs_password(&path, sel) {
+            return false;
+        }
+        self.pending_action = Some(action);
+        self.show_password = true;
+        self.status = "This archive needs a password.".into();
+        true
+    }
+
+    /// Continue what was interrupted by the password dialog.
+    fn resume_action(&mut self, ctx: &egui::Context, action: PendingAction) {
+        match action {
+            PendingAction::Extract(only_selected) => self.extract(ctx, only_selected),
+            PendingAction::Open(ask) => self.open_external(ctx, ask),
+            PendingAction::Preview => self.preview_selected(ctx),
+            PendingAction::Nothing => {}
+            PendingAction::DragExtract(items, dest) => {
+                if let Some(path) = self.path.clone() {
+                    self.drag_job = Some((path, items));
+                    self.drag_extract_to(ctx, dest);
+                }
+            }
+        }
+    }
+
     fn extract(&mut self, ctx: &egui::Context, only_selected: bool) {
         let Some(path) = self.path.clone() else { return };
+        let check_sel = only_selected.then(|| self.selected.clone());
+        if self.ask_password_first(check_sel.as_ref(), PendingAction::Extract(only_selected)) {
+            return;
+        }
         let Some(dest) = rfd::FileDialog::new().set_title("Extract to…").pick_folder() else {
             return;
         };
@@ -625,6 +687,10 @@ impl App {
     fn open_external(&mut self, ctx: &egui::Context, ask: bool) {
         let Some(path) = self.path.clone() else { return };
         let Some(full) = self.selected_files().into_iter().next() else { return };
+        let check_sel: HashSet<String> = std::iter::once(full.clone()).collect();
+        if self.ask_password_first(Some(&check_sel), PendingAction::Open(ask)) {
+            return;
+        }
         let pw = self.password.clone();
         self.run(ctx, "Opening…", move |p| {
             let dest = temp_dir();
@@ -649,6 +715,10 @@ impl App {
         }
         let Some(path) = self.path.clone() else { return };
         let Some(full) = self.selected_files().into_iter().next() else { return };
+        let check_sel: HashSet<String> = std::iter::once(full.clone()).collect();
+        if self.ask_password_first(Some(&check_sel), PendingAction::Preview) {
+            return;
+        }
         let pw = self.password.clone();
         self.busy = true;
         archive::progress_reset();
@@ -707,6 +777,15 @@ impl App {
             .map(|t| dest.join(t.rsplit('/').next().unwrap_or(t)))
             .collect();
 
+        // Ask before the drag starts: the password dialog cannot appear mid-drag.
+        let drag_sel: HashSet<String> = tops.iter().cloned().collect();
+        if self.password.is_empty() && archive::needs_password(&path, Some(&drag_sel)) {
+            self.pending_action = Some(PendingAction::Nothing);
+            self.show_password = true;
+            self.status = "This archive needs a password – enter it, then drag again.".into();
+            return;
+        }
+
         let state = DragState::new(planned);
         let started = self
             .drag
@@ -717,6 +796,9 @@ impl App {
             self.status = "Dragging files out is only supported on Wayland.".into();
             return;
         };
+
+        self.drag_state = Some(state.clone());
+        self.status_before_drag = self.status.clone();
 
         if uri_mode {
             // Plain file-list drag (no D-Bus): the files must exist before the target can be
@@ -753,6 +835,10 @@ impl App {
             return;
         }
         let sel: HashSet<String> = items.into_iter().collect();
+        self.drag_state = None; // the drop went through, nothing left to cancel
+        if self.ask_password_first(Some(&sel), PendingAction::DragExtract(sel.iter().cloned().collect(), dest.clone())) {
+            return;
+        }
         let pw = self.password.clone();
         let ask = make_ask(self.tx.clone(), ctx.clone());
         self.run(ctx, "Extracting…", move |p| archive::extract_checked(&path, &dest, Some(&sel), &pw, p, &ask));
@@ -1120,6 +1206,24 @@ impl eframe::App for App {
         }
         while let Ok(dest) = self.extract_rx.try_recv() {
             self.drag_extract_to(ctx, dest);
+        }
+        // A drag that the compositor cancelled (Escape, released over nothing, …) must not
+        // leave "Dragging…" in the status bar.
+        if let Some(d) = self.drag_state.clone() {
+            let cancelled = d.is_cancelled();
+            if cancelled || (d.is_finished() && self.drag_job.is_none()) {
+                self.drag_state = None;
+                if cancelled {
+                    self.drag_job = None;
+                }
+                if self.status.starts_with("Dragging") {
+                    self.status = if cancelled {
+                        std::mem::take(&mut self.status_before_drag)
+                    } else {
+                        "Ready.".into()
+                    };
+                }
+            }
         }
         if let Some(p) = dropped.filter(|_| self.conflict.is_none() && !self.show_password) {
             self.open(ctx, p);
@@ -2003,12 +2107,18 @@ impl eframe::App for App {
 
             if apply {
                 self.show_password = false;
-                if let Some(p) = self.pw_retry.take().or_else(|| self.path.clone()) {
+                if let Some(action) = self.pending_action.take() {
+                    // password needed for an action, not for opening: resume it
+                    self.resume_action(ctx, action);
+                } else if let Some(p) = self.pw_retry.take().or_else(|| self.path.clone()) {
                     self.open(ctx, p);
                 }
             } else if cancel || !open {
                 self.show_password = false;
                 self.pw_retry = None;
+                if self.pending_action.take().is_some() {
+                    self.status = "Cancelled.".into();
+                }
             } else {
                 self.show_password = true;
             }

@@ -1286,6 +1286,84 @@ fn extract_tar(
     Ok(count)
 }
 
+// ───────────────────────── password detection ─────────────────────────
+
+fn is_password_error(msg: &str) -> bool {
+    msg.to_lowercase().contains("password")
+}
+
+/// Does extracting `sel` (None = everything) need a password that we do not have yet?
+///
+/// This probes the archive with an empty password and looks for the "password required"
+/// error, so it is cheap: ZIP only reads headers, 7z decodes the first byte of the first
+/// file, RAR tests the first wanted file. Any other problem returns false and is reported
+/// by the extraction itself.
+pub fn needs_password(path: &Path, sel: Option<&HashSet<String>>) -> bool {
+    let Some(fmt) = Format::detect(path) else { return false };
+    match fmt {
+        Format::SevenZ => {
+            let mut reader = match open_7z(path, "") {
+                Ok(r) => r,
+                Err(e) => return is_password_error(&e),
+            };
+            let r = reader.for_each_entries(|entry, data| {
+                if entry.is_directory() || entry.size() == 0 {
+                    return Ok(true);
+                }
+                let mut b = [0u8; 1];
+                let _ = data.read(&mut b)?;
+                Ok(false) // one file is enough: a folder shares one encryption setting
+            });
+            r.map_err(es).err().map_or(false, |e| is_password_error(&e))
+        }
+        Format::Rar => {
+            let p = path.to_path_buf();
+            let Ok(mut archive) = rar_archive(&p, "").open_for_processing() else { return false };
+            loop {
+                let header = match archive.read_header() {
+                    Ok(Some(h)) => h,
+                    Ok(None) => return false,
+                    Err(e) => return is_password_error(&es(e)),
+                };
+                let name = norm(&header.entry().filename.to_string_lossy());
+                if header.entry().is_directory() || !wanted(&name, sel) {
+                    archive = match header.skip() {
+                        Ok(a) => a,
+                        Err(_) => return false,
+                    };
+                    continue;
+                }
+                return match header.test() {
+                    Ok(_) => false,
+                    Err(e) => is_password_error(&es(e)),
+                };
+            }
+        }
+        Format::Zip => {
+            let Ok((f, _)) = open_seekable(path) else { return false };
+            let Ok(mut z) = zip::ZipArchive::new(f) else { return false };
+            for i in 0..z.len() {
+                let name = match z.by_index_raw(i) {
+                    Ok(f) if f.is_dir() => continue,
+                    Ok(f) => norm(f.name()),
+                    Err(_) => continue,
+                };
+                if !wanted(&name, sel) {
+                    continue;
+                }
+                // without a password, an encrypted entry cannot even be opened
+                if let Err(e) = z.by_index(i) {
+                    if is_password_error(&es(e)) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        Format::Tar(_) | Format::Single(_) => false,
+    }
+}
+
 // ────────────────────────────── testing ────────────────────────────
 
 /// Read every entry and verify checksums without writing anything.
