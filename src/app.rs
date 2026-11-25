@@ -1386,23 +1386,35 @@ impl eframe::App for App {
                 total += n.size;
             }
         }
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            // progress: a green fill growing from the left, behind the text
-            if self.busy {
+        egui::TopBottomPanel::bottom("status")
+        .frame(
+            egui::Frame::side_top_panel(&ctx.style()).fill(
+                if self.conflict.is_some() {
+                    Color32::from_rgb(230, 126, 34) // Orange
+                } else {
+                    ctx.style().visuals.panel_fill
+                },
+            ),
+        )
+        .show(ctx, |ui| {
+            // Progress: a green fill growing from the left, behind the text
+            if self.busy && self.conflict.is_none() {
                 if let Some(f) = archive::progress_fraction() {
                     let r = ui.clip_rect();
                     ui.painter().rect_filled(
                         Rect::from_min_size(r.min, Vec2::new(r.width() * f, r.height())),
-                        0.0,
-                        Color32::from_rgba_unmultiplied(39, 174, 96, 130),
+                                             0.0,
+                                             Color32::from_rgba_unmultiplied(39, 174, 96, 130),
                     );
                 }
             }
+
             ui.horizontal(|ui| {
                 if self.busy {
                     ui.spinner();
                 }
                 ui.add(egui::Label::new(self.status.as_str()).selectable(false));
+
                 if self.path.is_some() {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let sel = if self.selected.is_empty() {
@@ -1413,7 +1425,7 @@ impl eframe::App for App {
                         ui.add(
                             egui::Label::new(format!(
                                 "{sel}{folders} folder(s), {files} file(s), {}",
-                                human(total)
+                                                     human(total)
                             ))
                             .selectable(false),
                         );
