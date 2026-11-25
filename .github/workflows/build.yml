@@ -28,7 +28,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${{ github.event.release.tag_name }}"
-          asset="RustArc-${tag}-linux-x86_64.AppImage"
-          mv RustArc-x86_64.AppImage "$asset"
-          gh release upload "$tag" "$asset" --clobber
+          asset=(RustArc-*-x86_64.AppImage)
+          sha256sum "$asset" > "${asset}.sha256"
+          gh release upload "${{ github.event.release.tag_name }}" "$asset" "${asset}.sha256" --clobber

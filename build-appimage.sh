@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds RustArc-x86_64.AppImage.
+# Builds RustArc-<version>-linux-x86_64.AppImage.
 # Needs: rustup/cargo, a C++ compiler (g++), curl.
 # TIP: build on an older distro (e.g. Ubuntu 22.04) so the AppImage runs on more systems.
 set -euo pipefail
@@ -7,6 +7,12 @@ cd "$(dirname "$0")"
 
 ARCH="${ARCH:-x86_64}"
 export ARCH
+
+VERSION="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+if [ -z "$VERSION" ]; then
+  echo "error: could not determine version from Cargo.toml" >&2
+  exit 1
+fi
 
 cargo build --release
 
@@ -43,10 +49,11 @@ fi
 TOOL=build/appimagetool
 if [ ! -x "$TOOL" ]; then
   mkdir -p build
-  curl -L -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
+  curl -L -o "$TOOL" "https://github.com{ARCH}.AppImage"
   chmod +x "$TOOL"
 fi
 
+OUTPUT="RustArc-${VERSION}-linux-${ARCH}.AppImage"
 # --appimage-extract-and-run lets this work on machines/CI without FUSE.
-"$TOOL" --appimage-extract-and-run "$APPDIR" "RustArc-${ARCH}.AppImage"
-echo "Done: RustArc-${ARCH}.AppImage"
+"$TOOL" --appimage-extract-and-run "$APPDIR" "$OUTPUT"
+echo "Done: $OUTPUT"
