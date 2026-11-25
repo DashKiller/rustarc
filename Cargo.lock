@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "rustarc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bzip2 0.4.4",
  "chrono",

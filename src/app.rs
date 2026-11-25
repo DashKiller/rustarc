@@ -15,7 +15,7 @@ use std::{
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, Sense, Vec2};
 use egui_extras::{Column, TableBuilder};
 
-use crate::archive::{self, Entry, Format};
+use crate::archive::{self, Answer, Conflict, Entry, Format};
 use crate::icons::{self, Icon};
 use crate::wayland_dnd::{DragState, SharedDrag};
 
@@ -286,6 +286,75 @@ enum Msg {
     Opened(PathBuf, Result<(Format, Vec<Entry>), String>),
     Done(Result<String, String>),
     Preview(String, Result<String, String>),
+    /// extraction hit an existing file; the worker waits for the answer
+    Conflict(Conflict, Sender<Answer>),
+}
+
+/// "File Already Exists" dialog state.
+struct ConflictUi {
+    info: Conflict,
+    reply: Sender<Answer>,
+    rename: String,
+    all: bool,
+}
+
+/// Called on the worker thread: shows the dialog in the UI and waits for the user's answer.
+fn make_ask(tx: Sender<Msg>, ctx: egui::Context) -> impl Fn(Conflict) -> Answer {
+    move |c| {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        if tx.send(Msg::Conflict(c, rtx)).is_err() {
+            return Answer::Cancel;
+        }
+        ctx.request_repaint();
+        rrx.recv().unwrap_or(Answer::Cancel)
+    }
+}
+
+/// One side (source or destination) of the "File Already Exists" dialog: title, one-line
+/// path, then the file-type icon next to size and date.
+fn conflict_column(ui: &mut egui::Ui, title: &str, path: &str, name: &str, is_dir: bool, size: &str, date: &str) {
+    ui.strong(title);
+    ui.add(egui::Label::new(path).wrap_mode(egui::TextWrapMode::Extend));
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(48.0, 56.0), Sense::hover());
+        let icon = if is_dir { Icon::Folder } else { icons::for_file(name) };
+        icons::draw(ui.painter(), rect, icon, type_color(icon, ui.visuals()));
+        ui.vertical(|ui| {
+            ui.label(format!("Size: {size}"));
+            ui.label(format!("Date: {date}"));
+        });
+    });
+}
+
+fn suggest_name(dir: &std::path::Path, name: &str) -> String {
+    let p = std::path::Path::new(name);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| name.to_string());
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut n = 1;
+    loop {
+        let cand = format!("{stem} ({n}){ext}");
+        if std::fs::symlink_metadata(dir.join(&cand)).is_err() {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// Shorten in the middle ("/home/hood/De...64.tar.gz:/qt.conf"), keeping both ends readable.
+fn shorten(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(3);
+    let head = keep / 2;
+    let tail = keep - head;
+    format!(
+        "{}...{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
 }
 
 pub struct App {
@@ -310,6 +379,7 @@ pub struct App {
     pw_retry: Option<PathBuf>,
     preview: Option<(String, String)>,
     confirm_remove: Option<Vec<String>>,
+    conflict: Option<ConflictUi>,
     rename: Option<(String, String)>,
     clipboard: Option<(PathBuf, Vec<String>, bool)>,
     status: String,
@@ -369,6 +439,7 @@ impl App {
             pw_retry: None,
             preview: None,
             confirm_remove: None,
+            conflict: None,
             rename: None,
             clipboard: None,
             status: "Open an archive (or drop one here).".into(),
@@ -483,6 +554,15 @@ impl App {
                         self.open(ctx, p);
                     }
                 }
+                Msg::Conflict(info, reply) => {
+                    self.conflict = Some(ConflictUi { rename: info.name.clone(), info, reply, all: false });
+                    // Bring the window forward. Some Wayland compositors refuse to raise a
+                    // window on their own; the attention request then flashes the taskbar entry.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Informational,
+                    ));
+                }
                 Msg::Preview(name, res) => {
                     self.busy = false;
                     match res {
@@ -530,8 +610,9 @@ impl App {
         };
         let sel: Option<HashSet<String>> = only_selected.then(|| self.selected.clone());
         let pw = self.password.clone();
+        let ask = make_ask(self.tx.clone(), ctx.clone());
         self.run(ctx, "Extracting…", move |p| {
-            archive::extract(&path, &dest, sel.as_ref(), &pw, p)
+            archive::extract_checked(&path, &dest, sel.as_ref(), &pw, p, &ask)
         });
     }
 
@@ -673,7 +754,8 @@ impl App {
         }
         let sel: HashSet<String> = items.into_iter().collect();
         let pw = self.password.clone();
-        self.run(ctx, "Extracting…", move |p| archive::extract(&path, &dest, Some(&sel), &pw, p));
+        let ask = make_ask(self.tx.clone(), ctx.clone());
+        self.run(ctx, "Extracting…", move |p| archive::extract_checked(&path, &dest, Some(&sel), &pw, p, &ask));
     }
 
     /// Selected items without those already covered by a selected parent folder.
@@ -1039,16 +1121,19 @@ impl eframe::App for App {
         while let Ok(dest) = self.extract_rx.try_recv() {
             self.drag_extract_to(ctx, dest);
         }
-        if let Some(p) = dropped {
+        if let Some(p) = dropped.filter(|_| self.conflict.is_none()) {
             self.open(ctx, p);
         }
 
+        // While the "File Already Exists" dialog is open the main window is disabled.
+        let modal = self.conflict.is_some();
+
         // Keyboard shortcuts
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+        if !modal && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             self.show_find = !self.show_find;
             self.focus_find = self.show_find;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+        if !modal && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
             self.pick_and_open(ctx);
         }
 
@@ -1074,7 +1159,7 @@ impl eframe::App for App {
         let can_add = has && self.can_modify();
 
         // Shortcuts shown in the context menu
-        if !ctx.wants_keyboard_input() && has {
+        if !modal && !ctx.wants_keyboard_input() && has {
             let has_items = !self.selected.is_empty();
             if has_file_sel && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
                 self.preview_selected(ctx);
@@ -1921,6 +2006,81 @@ impl eframe::App for App {
             self.do_rename(ctx, f, n);
         } else if rename_cancel {
             self.rename = None;
+        }
+
+        // ── file already exists ──
+        let mut conflict_answer: Option<Answer> = None;
+        if let Some(c) = self.conflict.as_mut() {
+            // Dim the main window and swallow every click on it.
+            let screen = ctx.screen_rect();
+            egui::Area::new(egui::Id::new("conflict_blocker"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(screen.min)
+                .show(ctx, |ui| {
+                    ui.allocate_response(screen.size(), Sense::click_and_drag());
+                    ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(120));
+                });
+            egui::Window::new("File Already Exists")
+                .order(egui::Order::Tooltip)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| ui.label("Would you like to overwrite the destination?"));
+                    ui.add_space(8.0);
+                    ui.columns(2, |cols| {
+                        let info = &c.info;
+                        conflict_column(
+                            &mut cols[0],
+                            "Source",
+                            &shorten(&info.source_label, 38),
+                            &info.name,
+                            info.src_dir,
+                            &info.src_size,
+                            &info.src_date,
+                        );
+                        conflict_column(
+                            &mut cols[1],
+                            "Destination",
+                            &shorten(&info.dest_label, 38),
+                            &info.name,
+                            info.dst_dir,
+                            &info.dst_size,
+                            &info.dst_date,
+                        );
+                    });
+                    ui.add_space(8.0);
+                    ui.label("Rename:");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut c.rename).desired_width(300.0));
+                        if ui.button("Suggest New Name").clicked() {
+                            c.rename = suggest_name(&c.info.dest_dir, &c.info.name);
+                        }
+                    });
+                    ui.add_space(8.0);
+                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut c.all, "Apply to All");
+                        if ui.button("Skip").clicked() {
+                            conflict_answer = Some(Answer::Skip { all: c.all });
+                        }
+                        let valid = !c.rename.is_empty() && c.rename != c.info.name && !c.rename.contains('/');
+                        if ui.add_enabled(valid, egui::Button::new("Rename")).clicked() {
+                            conflict_answer = Some(Answer::Rename(c.rename.clone()));
+                        }
+                        if ui.button("Overwrite").clicked() {
+                            conflict_answer = Some(Answer::Overwrite { all: c.all });
+                        }
+                        if ui.button("Cancel").clicked() || esc {
+                            conflict_answer = Some(Answer::Cancel);
+                        }
+                    });
+                });
+        }
+        if let Some(a) = conflict_answer {
+            if let Some(c) = self.conflict.take() {
+                let _ = c.reply.send(a);
+            }
         }
 
         // ── confirm removal ──

@@ -826,6 +826,7 @@ fn list_tar(path: &Path, comp: Comp) -> Result<Vec<Entry>, String> {
 // ──────────────────────────── extraction ───────────────────────────
 
 /// Extract everything (`sel == None`) or only the selected names.
+/// Existing files are overwritten silently; use `extract_checked` for user-facing extraction.
 pub fn extract(
     path: &Path,
     dest: &Path,
@@ -833,6 +834,238 @@ pub fn extract(
     password: &str,
     progress: Progress,
 ) -> Result<String, String> {
+    let count = extract_count(path, dest, sel, password, progress)?;
+    Ok(format!("Extracted {count} item(s) to {}", dest.display()))
+}
+
+/// What the user is asked when an extracted item would replace an existing one.
+#[derive(Clone, Debug)]
+pub struct Conflict {
+    /// file or folder name that clashes
+    pub name: String,
+    /// folder the item is going into
+    pub dest_dir: PathBuf,
+    /// "archive.7z:/path/inside"
+    pub source_label: String,
+    pub src_size: String,
+    pub src_date: String,
+    pub src_dir: bool,
+    /// full path of the existing item
+    pub dest_label: String,
+    pub dst_size: String,
+    pub dst_date: String,
+    pub dst_dir: bool,
+}
+
+/// The user's decision about one clash. `all` = "Apply to All".
+#[derive(Clone, Debug)]
+pub enum Answer {
+    Overwrite { all: bool },
+    Skip { all: bool },
+    Rename(String),
+    Cancel,
+}
+
+pub type Ask<'a> = &'a dyn Fn(Conflict) -> Answer;
+
+fn human_size(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{v:.1} {}", U[i])
+}
+
+/// (size, date) of a file on disk, formatted like KDE's replace dialog.
+fn describe(p: &Path) -> (String, String) {
+    use chrono::TimeZone;
+    let m = fs::symlink_metadata(p).ok();
+    let size = match &m {
+        Some(m) if m.is_dir() => "Folder".to_string(),
+        Some(m) => human_size(m.len()),
+        None => "?".to_string(),
+    };
+    let date = m
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| chrono::Local.timestamp_opt(d.as_secs() as i64, 0).single())
+        .map(|d| d.format("%A, %-d %B %Y %H:%M:%S").to_string())
+        .unwrap_or_default();
+    (size, date)
+}
+
+fn is_real_dir(p: &Path) -> bool {
+    fs::symlink_metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// Moves freshly extracted items into the destination, asking about every clash.
+struct Placer<'a> {
+    ask: Ask<'a>,
+    archive_name: String,
+    /// Some(true) = overwrite everything, Some(false) = skip everything
+    sticky: Option<bool>,
+    cancelled: bool,
+    skipped: usize,
+}
+
+impl Placer<'_> {
+    fn place(&mut self, from: &Path, to_dir: &Path, name: &std::ffi::OsStr, rel: &str) -> Result<(), String> {
+        let mut name = name.to_os_string();
+        loop {
+            if self.cancelled {
+                return Ok(());
+            }
+            let to = to_dir.join(&name);
+            // symlink_metadata: a dangling symlink in the way is a clash too
+            if fs::symlink_metadata(&to).is_err() {
+                return fs::rename(from, &to).map_err(es);
+            }
+            // folder onto folder: merge, asking about the files that clash
+            if is_real_dir(from) && is_real_dir(&to) {
+                let mut kids: Vec<_> = fs::read_dir(from)
+                    .map_err(es)?
+                    .filter_map(Result::ok)
+                    .map(|e| e.file_name())
+                    .collect();
+                kids.sort();
+                for k in kids {
+                    let child_rel = format!("{rel}/{}", k.to_string_lossy());
+                    self.place(&from.join(&k), &to, &k, &child_rel)?;
+                }
+                return Ok(());
+            }
+
+            let answer = match self.sticky {
+                Some(true) => Answer::Overwrite { all: true },
+                Some(false) => Answer::Skip { all: true },
+                None => {
+                    let (src_size, src_date) = describe(from);
+                    let (dst_size, dst_date) = describe(&to);
+                    (self.ask)(Conflict {
+                        name: name.to_string_lossy().into_owned(),
+                        dest_dir: to_dir.to_path_buf(),
+                        source_label: format!("{}:/{rel}", self.archive_name),
+                        src_size,
+                        src_date,
+                        src_dir: is_real_dir(from),
+                        dest_label: to.display().to_string(),
+                        dst_size,
+                        dst_date,
+                        dst_dir: is_real_dir(&to),
+                    })
+                }
+            };
+            match answer {
+                Answer::Overwrite { all } => {
+                    if all {
+                        self.sticky = Some(true);
+                    }
+                    if is_real_dir(&to) {
+                        fs::remove_dir_all(&to).map_err(es)?;
+                    } else {
+                        fs::remove_file(&to).map_err(es)?;
+                    }
+                    return fs::rename(from, &to).map_err(es);
+                }
+                Answer::Skip { all } => {
+                    if all {
+                        self.sticky = Some(false);
+                    }
+                    self.skipped += 1;
+                    return Ok(());
+                }
+                Answer::Rename(new) => {
+                    // invalid or unchanged names just ask again
+                    if !new.is_empty() && !new.contains('/') {
+                        name = new.into();
+                    }
+                }
+                Answer::Cancel => {
+                    self.cancelled = true;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Like `extract`, but never overwrites anything without asking. The archive is unpacked into
+/// a hidden staging folder inside `dest`; items whose name is free are moved into place and for
+/// every clash `ask` is called (the UI shows a "File Already Exists" dialog).
+pub fn extract_checked(
+    path: &Path,
+    dest: &Path,
+    sel: Option<&HashSet<String>>,
+    password: &str,
+    progress: Progress,
+    ask: Ask,
+) -> Result<String, String> {
+    fs::create_dir_all(dest).map_err(es)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // same folder as the destination => the final moves are cheap renames
+    let staging = dest.join(format!(".rustarc-extract-{}-{nanos}", std::process::id()));
+
+    let result = (|| -> Result<String, String> {
+        let count = extract_count(path, &staging, sel, password, progress)?;
+
+        let mut placer = Placer {
+            ask,
+            archive_name: path.display().to_string(),
+            sticky: None,
+            cancelled: false,
+            skipped: 0,
+        };
+        let mut names: Vec<std::ffi::OsString> = fs::read_dir(&staging)
+            .map_err(es)?
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        names.sort();
+        for name in names {
+            let top = name.to_string_lossy().into_owned();
+            // With a selection, items are extracted without their parent folders; for the
+            // dialog, show where they really are inside the archive.
+            let rel = sel
+                .and_then(|set| {
+                    set.iter()
+                        .map(|f| f.trim_end_matches('/'))
+                        .find(|f| f.rsplit('/').next() == Some(top.as_str()))
+                        .map(String::from)
+                })
+                .unwrap_or(top);
+            placer.place(&staging.join(&name), dest, &name, &rel)?;
+        }
+
+        let mut note = String::new();
+        if placer.skipped > 0 {
+            note.push_str(&format!("; {} skipped", placer.skipped));
+        }
+        if placer.cancelled {
+            note.push_str("; cancelled");
+        }
+        Ok(format!("Extracted {count} item(s) to {}{note}", dest.display()))
+    })();
+
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+fn extract_count(
+    path: &Path,
+    dest: &Path,
+    sel: Option<&HashSet<String>>,
+    password: &str,
+    progress: Progress,
+) -> Result<usize, String> {
     fs::create_dir_all(dest).map_err(es)?;
     let count = match Format::detect(path).ok_or("Unsupported archive format")? {
         Format::SevenZ => extract_7z(path, dest, sel, password, progress)?,
@@ -853,7 +1086,7 @@ pub fn extract(
             }
         }
     };
-    Ok(format!("Extracted {count} item(s) to {}", dest.display()))
+    Ok(count)
 }
 
 fn extract_7z(
