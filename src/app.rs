@@ -777,15 +777,6 @@ impl App {
             .map(|t| dest.join(t.rsplit('/').next().unwrap_or(t)))
             .collect();
 
-        // Ask before the drag starts: the password dialog cannot appear mid-drag.
-        let drag_sel: HashSet<String> = tops.iter().cloned().collect();
-        if self.password.is_empty() && archive::needs_password(&path, Some(&drag_sel)) {
-            self.pending_action = Some(PendingAction::Nothing);
-            self.show_password = true;
-            self.status = "This archive needs a password – enter it, then drag again.".into();
-            return;
-        }
-
         let state = DragState::new(planned);
         let started = self
             .drag
@@ -802,7 +793,16 @@ impl App {
 
         if uri_mode {
             // Plain file-list drag (no D-Bus): the files must exist before the target can be
-            // answered, so extract them now.
+            // answered, so extract them now. A password can't wait for the drop here.
+            let drag_sel: HashSet<String> = tops.iter().cloned().collect();
+            if self.password.is_empty() && archive::needs_password(&path, Some(&drag_sel)) {
+                state.finish(Err("password required".into()));
+                self.drag_state = None;
+                self.pending_action = Some(PendingAction::Nothing);
+                self.show_password = true;
+                self.status = "This archive needs a password – enter it, then drag again.".into();
+                return;
+            }
             self.status = format!("Dragging {} item(s) – large files can take a moment.", tops.len());
             let pw = self.password.clone();
             thread::spawn(move || {
