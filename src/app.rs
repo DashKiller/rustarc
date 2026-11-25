@@ -1121,12 +1121,12 @@ impl eframe::App for App {
         while let Ok(dest) = self.extract_rx.try_recv() {
             self.drag_extract_to(ctx, dest);
         }
-        if let Some(p) = dropped.filter(|_| self.conflict.is_none()) {
+        if let Some(p) = dropped.filter(|_| self.conflict.is_none() && !self.show_password) {
             self.open(ctx, p);
         }
 
-        // While the "File Already Exists" dialog is open the main window is disabled.
-        let modal = self.conflict.is_some();
+        // Keep the main window inactive while either dialog is open.
+        let modal = self.conflict.is_some() || self.show_password;
 
         // Keyboard shortcuts
         if !modal && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
@@ -1964,27 +1964,53 @@ impl eframe::App for App {
         if self.show_password {
             let mut open = true;
             let mut apply = false;
+            let mut cancel = false;
+
+            // Dim the main window and swallow clicks, just like "File Already Exists".
+            let screen = ctx.screen_rect();
+            egui::Area::new(egui::Id::new("password_blocker"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.allocate_response(screen.size(), Sense::click_and_drag());
+                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(120));
+            });
+
             egui::Window::new("Password")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label("Enter the archive password:");
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        apply = true;
-                    }
+            .order(egui::Order::Tooltip)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Enter the archive password:");
+                let r = ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+
+                let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
                     if ui.button("OK").clicked() {
                         apply = true;
                     }
+                    if ui.button("Cancel").clicked() || esc {
+                        cancel = true;
+                    }
                 });
+            });
+
             if apply {
                 self.show_password = false;
                 if let Some(p) = self.pw_retry.take().or_else(|| self.path.clone()) {
                     self.open(ctx, p);
                 }
+            } else if cancel || !open {
+                self.show_password = false;
+                self.pw_retry = None;
             } else {
-                self.show_password = open;
+                self.show_password = true;
             }
         }
 
