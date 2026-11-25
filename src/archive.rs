@@ -4,6 +4,7 @@
 //! and single-file .gz / .bz2 / .xz / .zst.
 //! Create: 7z, ZIP, TAR, TAR.GZ, TAR.BZ2, TAR.XZ, TAR.ZST (RAR creation is proprietary).
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
@@ -17,6 +18,77 @@ pub type Progress<'a> = &'a dyn Fn(String);
 
 fn es<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
+}
+
+// ───────────────────────────── progress ─────────────────────────────
+//
+// Operations report how much work there is (bytes) and how much is done; the UI polls it.
+// One long-running operation at a time is assumed.
+
+static PROG_DONE: AtomicU64 = AtomicU64::new(0);
+static PROG_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn progress_start(total: u64) {
+    PROG_DONE.store(0, AtomicOrdering::Relaxed);
+    PROG_TOTAL.store(total, AtomicOrdering::Relaxed);
+}
+
+fn progress_add(n: u64) {
+    PROG_DONE.fetch_add(n, AtomicOrdering::Relaxed);
+}
+
+/// Forget the previous operation (fraction becomes None).
+pub fn progress_reset() {
+    progress_start(0);
+}
+
+/// 0.0 ..= 1.0, or None when the current operation cannot tell.
+pub fn progress_fraction() -> Option<f32> {
+    let total = PROG_TOTAL.load(AtomicOrdering::Relaxed);
+    if total == 0 {
+        return None;
+    }
+    let done = PROG_DONE.load(AtomicOrdering::Relaxed);
+    Some((done as f64 / total as f64).min(1.0) as f32)
+}
+
+/// Counts the bytes that pass through a writer.
+struct CountingWriter<W: Write>(W);
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.0.write(buf)?;
+        progress_add(n as u64);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// Counts the bytes that pass through a reader.
+struct CountingReader<R: Read>(R);
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.0.read(buf)?;
+        progress_add(n as u64);
+        Ok(n)
+    }
+}
+
+/// Total size of the files below the given paths.
+fn tree_size(paths: &[PathBuf]) -> u64 {
+    fn walk(p: &Path) -> u64 {
+        match fs::metadata(p) {
+            Ok(m) if m.is_dir() => fs::read_dir(p)
+                .map(|rd| rd.filter_map(Result::ok).map(|e| walk(&e.path())).sum())
+                .unwrap_or(0),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        }
+    }
+    paths.iter().map(|p| walk(p)).sum()
 }
 
 // ─────────────────────────── split archives (.001, .002, …) ───────────────────────────
@@ -232,7 +304,22 @@ fn is_tar_stream(r: &mut dyn Read) -> bool {
 
 /// Open a file through the matching decompressor.
 fn open_reader(path: &Path, comp: Comp) -> io::Result<Box<dyn Read>> {
-    let (file, _) = open_seekable(path)?;
+    open_reader_impl(path, comp, false)
+}
+
+/// Same, but reports progress as the compressed file is consumed.
+fn open_reader_counted(path: &Path, comp: Comp) -> io::Result<Box<dyn Read>> {
+    open_reader_impl(path, comp, true)
+}
+
+fn open_reader_impl(path: &Path, comp: Comp, counted: bool) -> io::Result<Box<dyn Read>> {
+    let (file, len) = open_seekable(path)?;
+    let file: Box<dyn Read> = if counted {
+        progress_start(len);
+        Box::new(CountingReader(file))
+    } else {
+        Box::new(file)
+    };
     Ok(match comp {
         Comp::None => Box::new(BufReader::new(file)),
         Comp::Gz => Box::new(flate2::read::MultiGzDecoder::new(BufReader::new(file))),
@@ -759,7 +846,7 @@ pub fn extract(
             } else {
                 progress(format!("Extracting {name}"));
                 let target = safe_join(dest, &name).ok_or("Unsafe file name")?;
-                let mut r = open_reader(path, c).map_err(es)?;
+                let mut r = open_reader_counted(path, c).map_err(es)?;
                 let mut out = File::create(target).map_err(es)?;
                 io::copy(&mut r, &mut out).map_err(es)?;
                 1
@@ -788,15 +875,28 @@ fn extract_7z(
             .filter(|f| wanted(&norm(f.name()), sel))
             .count()
     });
+    // Work to do: everything up to (and including) the last wanted entry, in archive order.
+    let mut total = 0u64;
+    let mut seen = 0usize;
+    for f in &reader.archive().files {
+        total += f.size();
+        if wanted(&norm(f.name()), sel) {
+            seen += 1;
+            if expected.map_or(false, |n| seen >= n) {
+                break;
+            }
+        }
+    }
+    progress_start(total);
     reader
         .for_each_entries(|entry, data| {
             let name = norm(entry.name());
             if !wanted(&name, sel) {
-                io::copy(data, &mut io::sink())?; // must drain solid blocks
+                io::copy(data, &mut CountingWriter(io::sink()))?; // must drain solid blocks
                 return Ok(true);
             }
             let Some(target) = safe_join(dest, &rel_name(&name, sel)) else {
-                io::copy(data, &mut io::sink())?;
+                io::copy(data, &mut CountingWriter(io::sink()))?;
                 return Ok(true); // skip unsafe path
             };
             progress(format!("Extracting {name}"));
@@ -806,7 +906,7 @@ fn extract_7z(
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let mut out = File::create(&target)?;
+                let mut out = CountingWriter(File::create(&target)?);
                 io::copy(data, &mut out)?;
             }
             count += 1;
@@ -831,11 +931,24 @@ fn extract_rar(
     let p = path.to_path_buf();
     let mut archive = rar_archive(&p, password).open_for_processing().map_err(es)?;
     let mut count = 0usize;
+    // total work = unpacked size of everything that will be extracted
+    let total: u64 = rar_archive(&p, password)
+        .open_for_listing()
+        .map(|it| {
+            it.filter_map(Result::ok)
+                .filter(|h| wanted(&norm(&h.filename.to_string_lossy()), sel))
+                .map(|h| h.unpacked_size as u64)
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    progress_start(total);
     while let Some(header) = archive.read_header().map_err(es)? {
         let name = norm(&header.entry().filename.to_string_lossy());
+        let size = header.entry().unpacked_size as u64;
         archive = if wanted(&name, sel) {
             progress(format!("Extracting {name}"));
             count += 1;
+            progress_add(size); // RAR extracts a file in one call, so progress moves per file
             if sel.is_some() {
                 match safe_join(dest, &rel_name(&name, sel)) {
                     Some(target) if header.entry().is_directory() => {
@@ -869,6 +982,15 @@ fn extract_zip(
 ) -> Result<usize, String> {
     let mut z = zip::ZipArchive::new(open_seekable(path).map_err(es)?.0).map_err(es)?;
     let mut count = 0usize;
+    let mut total = 0u64;
+    for i in 0..z.len() {
+        if let Ok(f) = z.by_index_raw(i) {
+            if wanted(&norm(f.name()), sel) {
+                total += f.size();
+            }
+        }
+    }
+    progress_start(total);
     for i in 0..z.len() {
         let res = if password.is_empty() {
             z.by_index(i)
@@ -888,7 +1010,7 @@ fn extract_zip(
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(es)?;
             }
-            let mut out = File::create(&target).map_err(es)?;
+            let mut out = CountingWriter(File::create(&target).map_err(es)?);
             io::copy(&mut file, &mut out).map_err(es)?;
         }
         count += 1;
@@ -903,7 +1025,7 @@ fn extract_tar(
     sel: Option<&HashSet<String>>,
     progress: Progress,
 ) -> Result<usize, String> {
-    let mut ar = tar::Archive::new(open_reader(path, comp).map_err(es)?);
+    let mut ar = tar::Archive::new(open_reader_counted(path, comp).map_err(es)?);
     let mut count = 0usize;
     for e in ar.entries().map_err(es)? {
         let mut e = e.map_err(es)?;
@@ -1043,6 +1165,7 @@ pub fn create(sources: &[PathBuf], dest: &Path, progress: Progress) -> Result<St
 }
 
 fn create_kind(kind: Kind, sources: &[PathBuf], dest: &Path, progress: Progress) -> Result<(), String> {
+    progress_start(tree_size(sources));
     match kind {
         Kind::SevenZ => create_7z(sources, dest, progress),
         Kind::Zip => create_zip(sources, dest, progress),
@@ -1312,7 +1435,7 @@ fn add_7z(
             add_7z(w, &c.path(), child, progress)?;
         }
     } else {
-        let f = File::open(path).map_err(es)?;
+        let f = CountingReader(File::open(path).map_err(es)?);
         w.push_archive_entry(entry, Some(f)).map_err(es)?;
     }
     Ok(())
@@ -1348,7 +1471,7 @@ fn add_zip(
         }
     } else {
         w.start_file(name, opts).map_err(es)?;
-        let mut f = File::open(path).map_err(es)?;
+        let mut f = CountingReader(File::open(path).map_err(es)?);
         io::copy(&mut f, w).map_err(es)?;
     }
     Ok(())
@@ -1411,7 +1534,10 @@ fn add_tar<W: Write>(
             add_tar(b, &c.path(), child, progress)?;
         }
     } else {
-        b.append_path_with_name(path, &name).map_err(es)?;
+        let mut header = tar::Header::new_gnu();
+        header.set_metadata(&meta);
+        let f = CountingReader(File::open(path).map_err(es)?);
+        b.append_data(&mut header, &name, f).map_err(es)?;
     }
     Ok(())
 }

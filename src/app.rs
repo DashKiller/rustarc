@@ -415,6 +415,7 @@ impl App {
             return;
         }
         self.busy = true;
+        archive::progress_reset();
         self.status = label.into();
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         thread::spawn(move || {
@@ -569,6 +570,7 @@ impl App {
         let Some(full) = self.selected_files().into_iter().next() else { return };
         let pw = self.password.clone();
         self.busy = true;
+        archive::progress_reset();
         self.status = "Preparing preview…".into();
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         thread::spawn(move || {
@@ -1063,6 +1065,10 @@ impl eframe::App for App {
             self.last_title = title;
         }
 
+        if self.busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
         let has = self.path.is_some() && !self.busy;
         let has_file_sel = has && !self.selected_files().is_empty();
         let can_add = has && self.can_modify();
@@ -1296,6 +1302,17 @@ impl eframe::App for App {
             }
         }
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            // progress: a green fill growing from the left, behind the text
+            if self.busy {
+                if let Some(f) = archive::progress_fraction() {
+                    let r = ui.clip_rect();
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(r.min, Vec2::new(r.width() * f, r.height())),
+                        0.0,
+                        Color32::from_rgba_unmultiplied(39, 174, 96, 130),
+                    );
+                }
+            }
             ui.horizontal(|ui| {
                 if self.busy {
                     ui.spinner();
