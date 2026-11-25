@@ -16,6 +16,6 @@ selective extraction, zip-slip protection, background worker thread.
 ## Build the AppImage
     sudo apt install build-essential curl      # g++ is needed for the bundled UnRAR
     curl https://sh.rustup.rs -sSf | sh
-    ./build-appimage.sh                        # -> RustArc-x86_64.AppImage
+    ./build-appimage.sh                        # -> RustArc-VERSION-linux-x86_64.AppImage
 
 This is 100% AI slop.
