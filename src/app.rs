@@ -416,6 +416,8 @@ pub struct App {
     drag_state: Option<Arc<DragState>>,
     /// status text from before the drag started, restored if the drag is cancelled
     status_before_drag: String,
+    /// status text that reports a wrong password; shown red for as long as it stays the status
+    wrong_pw_status: Option<String>,
     /// drag-to-select: where the rubber band started (screen position)
     rubber: Option<Pos2>,
     /// selection that was there when the band started (kept when Ctrl is held)
@@ -477,6 +479,7 @@ impl App {
             drag_job: None,
             drag_state: None,
             status_before_drag: String::new(),
+            wrong_pw_status: None,
             rubber: None,
             rubber_base: HashSet::new(),
             sort_key: 0,
@@ -559,7 +562,12 @@ impl App {
                             if e.to_lowercase().contains("password") {
                                 self.pw_retry = Some(path);
                                 self.show_password = true;
-                                self.status = "This archive needs a password.".into();
+                                if self.password.is_empty() {
+                                    self.status = "This archive needs a password.".into();
+                                } else {
+                                    self.status = "Wrong password.".into();
+                                    self.wrong_pw_status = Some(self.status.clone());
+                                }
                             } else {
                                 self.status = format!("Error: {e}");
                             }
@@ -570,7 +578,13 @@ impl App {
                     self.busy = false;
                     self.status = match res {
                         Ok(s) => s,
-                        Err(e) => format!("Error: {e}"),
+                        Err(e) => {
+                            let s = format!("Error: {e}");
+                            if !self.password.is_empty() && e.to_lowercase().contains("password") {
+                                self.wrong_pw_status = Some(s.clone());
+                            }
+                            s
+                        }
                     };
                     if let Some(p) = self.pending_open.take() {
                         self.open(ctx, p);
@@ -1493,8 +1507,10 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status")
         .frame(
             egui::Frame::side_top_panel(&ctx.style()).fill(
-                if self.conflict.is_some() {
-                    Color32::from_rgb(230, 126, 34) // Orange
+                if self.wrong_pw_status.as_deref() == Some(self.status.as_str()) {
+                    Color32::from_rgb(192, 57, 43) // Red: wrong password
+                } else if self.conflict.is_some() || self.show_password {
+                    Color32::from_rgb(230, 126, 34) // Orange (same as the conflict dialog)
                 } else {
                     ctx.style().visuals.panel_fill
                 },
