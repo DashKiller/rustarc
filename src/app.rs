@@ -134,6 +134,51 @@ fn build_tree(entries: &[Entry]) -> Tree {
     Tree { nodes, roots }
 }
 
+/// Sort key 0 = Name, 1.. = the optional columns in COL_NAMES order (key = column index + 1).
+fn cmp_nodes(a: &Node, b: &Node, key: usize, asc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // folders always stay above files
+    let dirs = b.is_dir.cmp(&a.is_dir);
+    if dirs != Ordering::Equal {
+        return dirs;
+    }
+    let rate = |n: &Node| -> f64 {
+        match n.packed {
+            Some(p) if n.size > 0 && !n.is_dir => 1.0 - p as f64 / n.size as f64,
+            _ => -1.0,
+        }
+    };
+    let o = match key {
+        0 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        1 => a.size.cmp(&b.size),
+        2 => a.packed.cmp(&b.packed),
+        3 => a.mode.cmp(&b.mode),
+        4 => a.owner.cmp(&b.owner),
+        5 => a.group.cmp(&b.group),
+        6 => rate(a).partial_cmp(&rate(b)).unwrap_or(Ordering::Equal),
+        7 => a.crc.cmp(&b.crc),
+        8 => a.method.cmp(&b.method),
+        9 => a.version.cmp(&b.version),
+        _ => a.date.cmp(&b.date),
+    };
+    let o = if asc { o } else { o.reverse() };
+    o.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+}
+
+impl Tree {
+    /// Sort the children of every folder (and the top level) by the given column.
+    fn sort(&mut self, key: usize, asc: bool) {
+        for i in 0..self.nodes.len() {
+            let mut ch = std::mem::take(&mut self.nodes[i].children);
+            ch.sort_by(|&x, &y| cmp_nodes(&self.nodes[x], &self.nodes[y], key, asc));
+            self.nodes[i].children = ch;
+        }
+        let mut roots = std::mem::take(&mut self.roots);
+        roots.sort_by(|&x, &y| cmp_nodes(&self.nodes[x], &self.nodes[y], key, asc));
+        self.roots = roots;
+    }
+}
+
 /// Flatten the tree into the rows that are currently visible: (node index, depth).
 fn visible_rows(tree: &Tree, expanded: &HashSet<String>, needle: &str) -> Vec<(usize, usize)> {
     fn mark(tree: &Tree, i: usize, needle: &str, out: &mut Vec<bool>) -> bool {
@@ -282,6 +327,13 @@ pub struct App {
     extract_rx: Receiver<PathBuf>,
     /// what the current drag carries: (archive, top-level items)
     drag_job: Option<(PathBuf, Vec<String>)>,
+    /// drag-to-select: where the rubber band started (screen position)
+    rubber: Option<Pos2>,
+    /// selection that was there when the band started (kept when Ctrl is held)
+    rubber_base: HashSet<String>,
+    /// current sort: 0 = Name, otherwise column index + 1
+    sort_key: usize,
+    sort_asc: bool,
 }
 
 pub fn temp_dir() -> PathBuf {
@@ -332,6 +384,10 @@ impl App {
             drag,
             extract_rx,
             drag_job: None,
+            rubber: None,
+            rubber_base: HashSet::new(),
+            sort_key: 0,
+            sort_asc: true,
         }
     }
 
@@ -383,6 +439,7 @@ impl App {
                     match res {
                         Ok((fmt, entries)) => {
                             self.tree = build_tree(&entries);
+                            self.tree.sort(self.sort_key, self.sort_asc);
                             self.col_samples = (0..NCOLS)
                                 .map(|k| {
                                     let mut v: Vec<String> =
@@ -853,6 +910,11 @@ fn install_font(ctx: &egui::Context, bytes: Vec<u8>) {
     ctx.set_fonts(fonts);
 }
 
+/// One entry of a context menu; true when clicked.
+fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> bool {
+    ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut)).clicked()
+}
+
 fn human(n: u64) -> String {
     const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let (mut v, mut i) = (n as f64, 0);
@@ -1283,6 +1345,13 @@ impl eframe::App for App {
             let mut dbl: Option<usize> = None;
             let mut drag_start: Option<usize> = None;
             let mut right_clicked: Option<usize> = None;
+            let mut empty_click = false;
+            let sort_key = self.sort_key;
+            let sort_asc = self.sort_asc;
+            let mut sort_click: Option<usize> = None;
+            let mut rubber_out = self.rubber;
+            let mut rubber_hits: Option<Vec<usize>> = None;
+            let mut rubber_started: Option<bool> = None; // Some(ctrl held) when a band begins
             let mut menu_action: Option<MenuAction> = None;
             // facts the context menu needs (the table closure only borrows `self` immutably)
             let m_file_sel = has_file_sel;
@@ -1319,7 +1388,8 @@ impl eframe::App for App {
                     for s in &self.col_samples[k] {
                         w = w.max(measure(ui, s));
                     }
-                    widths[k] = (w + 8.0 + if Some(k) == last_col { 8.0 } else { 12.0 }).ceil();
+                    let arrow = if self.sort_key == k + 1 { 14.0 } else { 0.0 };
+                    widths[k] = (w + 8.0 + arrow + if Some(k) == last_col { 8.0 } else { 12.0 }).ceil();
                     used += widths[k];
                 }
             }
@@ -1340,18 +1410,21 @@ impl eframe::App for App {
             egui::ScrollArea::new([needs_h_scroll, false]).auto_shrink([false, false]).show(ui, |ui| {
             // Slot for the row backgrounds, reserved *before* any table content so that whatever
             // is drawn into it ends up underneath all cell text.
+            let bg_resp = ui.interact(ui.clip_rect(), ui.id().with("table_empty_area"), Sense::click());
             let bg_idx = ui.painter().add(egui::Shape::Noop);
-            let mut row_infos: Vec<(Rect, bool, bool, usize)> = Vec::new(); // rect, odd, selected, depth
+            let mut row_infos: Vec<(Rect, bool, bool, usize, usize)> = Vec::new(); // rect, odd, selected, depth, node
             let mut header_bottom = f32::NEG_INFINITY;
             let mut table = TableBuilder::new(ui)
                 .striped(false)
                 .sense(Sense::click_and_drag())
                 .column(Column::exact(name_w).clip(true));
             let mut headers: Vec<&str> = vec!["Name"];
+            let mut header_keys: Vec<usize> = vec![0];
             for k in 0..NCOLS {
                 if vis[k] {
                     table = table.column(Column::exact(widths[k]));
                     headers.push(COL_NAMES[k]);
+                    header_keys.push(k + 1);
                 }
             }
 
@@ -1360,6 +1433,12 @@ impl eframe::App for App {
                     for (i, t) in headers.iter().enumerate() {
                         let (hrect, _) = h.col(|ui| {
                             let resp = ui.interact(ui.max_rect(), ui.id().with(("col_header", i)), Sense::click());
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
+                                sort_click = Some(header_keys[i]);
+                            }
                             resp.context_menu(|ui| {
                                 for k in 0..NCOLS {
                                     ui.checkbox(&mut new_cols[k], COL_NAMES[k]);
@@ -1375,6 +1454,16 @@ impl eframe::App for App {
                             p.hline(rect.x_range(), rect.bottom() - 0.5, stroke);
                             if i + 1 < headers.len() {
                                 p.vline(rect.right() - 0.5, rect.y_range(), stroke);
+                            }
+                            if header_keys[i] == sort_key {
+                                // sort direction arrow at the right edge of the sorted column
+                                let c = Pos2::new(rect.right() - 12.0, rect.center().y);
+                                icons::draw(
+                                    ui.painter(),
+                                    Rect::from_center_size(c, Vec2::splat(11.0)),
+                                    if sort_asc { Icon::ChevronUp } else { Icon::ChevronDown },
+                                    ui.visuals().text_color(),
+                                );
                             }
                         });
                         header_bottom = header_bottom.max(hrect.bottom());
@@ -1394,6 +1483,7 @@ impl eframe::App for App {
                                 odd_row,
                                 is_selected,
                                 depth,
+                                ni,
                             ));
                             ui.horizontal_centered(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -1519,7 +1609,7 @@ impl eframe::App for App {
                     .filter(|pos| ui.ctx().layer_id_at(*pos) == Some(ui.layer_id()));
                 let accent = visuals.selection.bg_fill;
                 let mut shapes: Vec<egui::Shape> = Vec::new();
-                for (r, odd, sel, depth) in &row_infos {
+                for (r, odd, sel, depth, _) in &row_infos {
                     let vis_rect = r.intersect(body_clip);
                     if vis_rect.height() <= 0.0 {
                         continue;
@@ -1560,6 +1650,94 @@ impl eframe::App for App {
                 }
                 ui.painter().set(bg_idx, egui::Shape::Vec(shapes));
             }
+
+            // Clicking the empty area below the rows clears the selection; right-click also
+            // opens a menu where only the actions that need no selection are enabled.
+            if bg_resp.clicked() || bg_resp.secondary_clicked() {
+                empty_click = true;
+            }
+            // ── drag to select: press in the empty area below the rows and drag ──
+            {
+                let view = ui.clip_rect();
+                let body_area = Rect::from_min_max(
+                    Pos2::new(view.left(), header_bottom.max(view.top())),
+                    Pos2::new(view.right() - 14.0, view.bottom()), // keep clear of the scrollbar
+                );
+                let (pressed, down, latest, origin, ctrl) = ui.input(|i| {
+                    (
+                        i.pointer.primary_pressed(),
+                        i.pointer.primary_down(),
+                        i.pointer.latest_pos(),
+                        i.pointer.press_origin(),
+                        i.modifiers.command,
+                    )
+                });
+                if pressed {
+                    if let Some(pos) = origin.or(latest) {
+                        let on_row = row_infos.iter().any(|(r, ..)| r.contains(pos));
+                        if body_area.contains(pos)
+                            && !on_row
+                            && ui.ctx().layer_id_at(pos) == Some(ui.layer_id())
+                        {
+                            rubber_out = Some(pos);
+                            rubber_started = Some(ctrl);
+                        }
+                    }
+                }
+                if let Some(start) = rubber_out {
+                    if !down {
+                        rubber_out = None;
+                    } else if let Some(cur) = latest {
+                        let band = Rect::from_two_pos(start, cur);
+                        if band.width() > 4.0 || band.height() > 4.0 {
+                            let hits: Vec<usize> = row_infos
+                                .iter()
+                                .filter(|(r, ..)| r.intersect(body_area).intersects(band))
+                                .map(|&(_, _, _, _, ni)| ni)
+                                .collect();
+                            rubber_hits = Some(hits);
+                            let accent = visuals.selection.bg_fill;
+                            ui.painter().rect(
+                                band.intersect(body_area),
+                                0.0,
+                                accent.gamma_multiply(0.2),
+                                egui::Stroke::new(1.0_f32, accent),
+                            );
+                        }
+                    }
+                }
+            }
+
+            bg_resp.context_menu(|ui| {
+                menu_item(ui, "Preview", "Ctrl+P", false);
+                menu_item(ui, "Open in External Application", "", false);
+                menu_item(ui, "Open With…", "", false);
+                ui.separator();
+                menu_item(ui, "Rename…", "F2", false);
+                menu_item(ui, "Remove from Archive", "Del", false);
+                ui.menu_button("Extract", |ui| {
+                    if menu_item(ui, "Extract selected…", "Ctrl+E", m_has_sel) {
+                        menu_action = Some(MenuAction::ExtractSelected);
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, "Extract all…", "", true) {
+                        menu_action = Some(MenuAction::ExtractAll);
+                        ui.close_menu();
+                    }
+                });
+                ui.separator();
+                menu_item(ui, "Cut", "Ctrl+X", false);
+                menu_item(ui, "Copy", "Ctrl+C", false);
+                if menu_item(ui, "Paste", "Ctrl+V", m_can_modify && m_has_clip) {
+                    menu_action = Some(MenuAction::Paste);
+                    ui.close_menu();
+                }
+                ui.separator();
+                if menu_item(ui, "Add Files…", "Alt+A", m_can_modify) {
+                    menu_action = Some(MenuAction::AddFiles);
+                    ui.close_menu();
+                }
+            });
             });
             });
             if new_cols != self.show_cols {
@@ -1605,6 +1783,30 @@ impl eframe::App for App {
                 }
             }
 
+            if let Some(key) = sort_click {
+                if self.sort_key == key {
+                    self.sort_asc = !self.sort_asc;
+                } else {
+                    self.sort_key = key;
+                    self.sort_asc = true;
+                }
+                self.tree.sort(self.sort_key, self.sort_asc);
+            }
+            if empty_click {
+                self.selected.clear();
+            }
+            self.rubber = rubber_out;
+            if let Some(ctrl) = rubber_started {
+                self.rubber_base = if ctrl { self.selected.clone() } else { HashSet::new() };
+            }
+            if let Some(hits) = rubber_hits {
+                let mut set = self.rubber_base.clone();
+                for ni in hits {
+                    set.insert(self.tree.nodes[ni].full.clone());
+                }
+                self.selected = set;
+                self.last_clicked = None;
+            }
             if let Some(idx) = right_clicked {
                 let full = self.tree.nodes[idx].full.clone();
                 if !self.selected.contains(&full) {

@@ -19,6 +19,7 @@ pub enum Icon {
     Remove,
     Menu,
     ChevronDown,
+    ChevronUp,
     ChevronRight,
 }
 
@@ -122,6 +123,7 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[(2.0, 12.0), (14.0, 12.0)], false);
         }
         Icon::ChevronDown => line(&[(4.0, 6.0), (8.0, 10.0), (12.0, 6.0)], false),
+        Icon::ChevronUp => line(&[(4.0, 10.0), (8.0, 6.0), (12.0, 10.0)], false),
         Icon::ChevronRight => line(&[(6.0, 3.5), (10.5, 8.0), (6.0, 12.5)], false),
     }
 }
