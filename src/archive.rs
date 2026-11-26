@@ -12,7 +12,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use sevenz_rust::{Password, SevenZArchiveEntry, SevenZReader, SevenZWriter};
+use sevenz_rust::{BlockDecoder, Password, SevenZArchiveEntry, SevenZReader, SevenZWriter};
 
 pub type Progress<'a> = &'a dyn Fn(String);
 
@@ -1096,6 +1096,103 @@ fn extract_7z(
     password: &str,
     progress: Progress,
 ) -> Result<usize, String> {
+    match sel {
+        Some(sel) => extract_7z_selected(path, dest, sel, password, progress),
+        None => extract_7z_all(path, dest, password, progress),
+    }
+}
+
+/// Extract only some entries. A 7z archive is a list of independently compressed blocks (one
+/// big block when "solid"). A block can only be decoded from its start, but blocks that hold
+/// nothing we want are skipped completely instead of being decoded and thrown away, which is
+/// what makes picking one small file out of a big non-solid archive nearly instant.
+fn extract_7z_selected(
+    path: &Path,
+    dest: &Path,
+    sel: &HashSet<String>,
+    password: &str,
+    progress: Progress,
+) -> Result<usize, String> {
+    let sel = Some(sel);
+    let reader = open_7z(path, password)?;
+    let archive = reader.archive();
+    let (mut source, _) = open_seekable(path).map_err(es)?;
+    let password = pw(password);
+    let mut count = 0usize;
+
+    // Entries without data (folders, empty files) are not part of any block.
+    for f in archive.files.iter().filter(|f| !f.has_stream()) {
+        let name = norm(f.name());
+        if !wanted(&name, sel) {
+            continue;
+        }
+        let Some(target) = safe_join(dest, &rel_name(&name, sel)) else { continue };
+        if f.is_directory() {
+            fs::create_dir_all(&target).map_err(es)?;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(es)?;
+            }
+            File::create(&target).map_err(es)?;
+        }
+        count += 1;
+    }
+
+    // Entries with data, in the order the blocks hold them.
+    let stream_files: Vec<&SevenZArchiveEntry> = archive.files.iter().filter(|f| f.has_stream()).collect();
+    let mut first = 0usize;
+    let mut jobs: Vec<(usize, usize)> = Vec::new(); // (block, wanted entries in it)
+    let mut total = 0u64;
+    for block in 0..archive.folders.len() {
+        let n = BlockDecoder::new(block, archive, password.as_slice(), &mut source).entry_count();
+        let range = &stream_files[first..(first + n).min(stream_files.len())];
+        let wanted_here = range.iter().filter(|f| wanted(&norm(f.name()), sel)).count();
+        if wanted_here > 0 {
+            // up to the last wanted entry is all that has to be decoded
+            let last = range.iter().rposition(|f| wanted(&norm(f.name()), sel)).unwrap_or(0);
+            total += range[..=last].iter().map(|f| f.size()).sum::<u64>();
+            jobs.push((block, wanted_here));
+        }
+        first += n;
+    }
+    progress_start(total);
+
+    for (block, wanted_here) in jobs {
+        let mut left = wanted_here;
+        let decoder = BlockDecoder::new(block, archive, password.as_slice(), &mut source);
+        let mut each = |entry: &SevenZArchiveEntry, data: &mut dyn Read| -> Result<bool, sevenz_rust::Error> {
+            let name = norm(entry.name());
+            if !wanted(&name, sel) {
+                io::copy(data, &mut CountingWriter(io::sink()))?; // solid block: must be decoded
+                return Ok(true);
+            }
+            let Some(target) = safe_join(dest, &rel_name(&name, sel)) else {
+                io::copy(data, &mut CountingWriter(io::sink()))?;
+                left -= 1;
+                return Ok(left > 0);
+            };
+            progress(format!("Extracting {name}"));
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut out = CountingWriter(File::create(&target)?);
+            io::copy(data, &mut out)?;
+            count += 1;
+            left -= 1;
+            Ok(left > 0) // the rest of this block is not needed
+        };
+        let _ = decoder.for_each_entries(&mut each).map_err(es)?;
+    }
+    Ok(count)
+}
+
+fn extract_7z_all(
+    path: &Path,
+    dest: &Path,
+    password: &str,
+    progress: Progress,
+) -> Result<usize, String> {
+    let sel: Option<&HashSet<String>> = None;
     let mut reader = open_7z(path, password)?;
     let mut count = 0usize;
     // With a selection we know how many entries to expect (the file list is in the header),
@@ -1164,18 +1261,23 @@ fn extract_rar(
     let p = path.to_path_buf();
     let mut archive = rar_archive(&p, password).open_for_processing().map_err(es)?;
     let mut count = 0usize;
-    // total work = unpacked size of everything that will be extracted
-    let total: u64 = rar_archive(&p, password)
+    // total work = unpacked size of everything that will be extracted; also how many entries
+    // to expect, so we can stop as soon as the last one is out (headers only, so this is quick)
+    let (total, expected) = rar_archive(&p, password)
         .open_for_listing()
         .map(|it| {
             it.filter_map(Result::ok)
                 .filter(|h| wanted(&norm(&h.filename.to_string_lossy()), sel))
-                .map(|h| h.unpacked_size as u64)
-                .sum::<u64>()
+                .fold((0u64, 0usize), |(t, n), h| (t + h.unpacked_size as u64, n + 1))
         })
-        .unwrap_or(0);
+        .unwrap_or((0, 0));
     progress_start(total);
     while let Some(header) = archive.read_header().map_err(es)? {
+        // With a selection everything wanted may already be done; skipping the remaining
+        // entries of a solid archive would still mean decoding them.
+        if sel.is_some() && expected > 0 && count >= expected {
+            break;
+        }
         let name = norm(&header.entry().filename.to_string_lossy());
         let size = header.entry().unpacked_size as u64;
         archive = if wanted(&name, sel) {
@@ -1225,6 +1327,16 @@ fn extract_zip(
     }
     progress_start(total);
     for i in 0..z.len() {
+        // look at the name first; entries we do not want are not opened at all
+        if sel.is_some() {
+            let name = match z.by_index_raw(i) {
+                Ok(f) => norm(f.name()),
+                Err(_) => continue,
+            };
+            if !wanted(&name, sel) {
+                continue;
+            }
+        }
         let res = if password.is_empty() {
             z.by_index(i)
         } else {
@@ -1318,6 +1430,16 @@ pub fn needs_password(path: &Path, sel: Option<&HashSet<String>>) -> bool {
         }
         Format::Rar => {
             let p = path.to_path_buf();
+            // test the smallest wanted file (headers only to find it), so this stays quick
+            let smallest = rar_archive(&p, "").open_for_listing().ok().and_then(|it| {
+                it.filter_map(Result::ok)
+                    .filter(|h| !h.is_directory())
+                    .map(|h| (norm(&h.filename.to_string_lossy()), h.unpacked_size as u64))
+                    .filter(|(n, _)| wanted(n, sel))
+                    .min_by_key(|(_, s)| *s)
+                    .map(|(n, _)| n)
+            });
+            let Some(smallest) = smallest else { return false };
             let Ok(mut archive) = rar_archive(&p, "").open_for_processing() else { return false };
             loop {
                 let header = match archive.read_header() {
@@ -1325,8 +1447,7 @@ pub fn needs_password(path: &Path, sel: Option<&HashSet<String>>) -> bool {
                     Ok(None) => return false,
                     Err(e) => return is_password_error(&es(e)),
                 };
-                let name = norm(&header.entry().filename.to_string_lossy());
-                if header.entry().is_directory() || !wanted(&name, sel) {
+                if norm(&header.entry().filename.to_string_lossy()) != smallest {
                     archive = match header.skip() {
                         Ok(a) => a,
                         Err(_) => return false,
