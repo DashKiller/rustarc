@@ -424,6 +424,8 @@ pub struct App {
     wrong_pw_status: Option<String>,
     /// the action that is running, so it can be retried after a wrong password
     last_action: Option<PendingAction>,
+    /// where the password field's right-click menu is open, if it is
+    pw_menu: Option<Pos2>,
     /// drag-to-select: where the rubber band started (screen position)
     rubber: Option<Pos2>,
     /// selection that was there when the band started (kept when Ctrl is held)
@@ -487,6 +489,7 @@ impl App {
             status_before_drag: String::new(),
             wrong_pw_status: None,
             last_action: None,
+            pw_menu: None,
             rubber: None,
             rubber_base: HashSet::new(),
             sort_key: 0,
@@ -1181,6 +1184,32 @@ fn type_color(_icon: Icon, visuals: &egui::Visuals) -> Color32 {
 }
 
 /// Breeze Dark look (as used by KDE Ark).
+/// Text from the system clipboard, as a single line. egui 0.29 has no way to ask for the
+/// clipboard from a menu click, so this uses arboard, then the usual command line tools.
+fn read_clipboard_text() -> Option<String> {
+    const TOOLS: [(&str, &[&str]); 3] = [
+        ("wl-paste", &["--no-newline"]),
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("xsel", &["--clipboard", "--output"]),
+    ];
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        if let Ok(text) = cb.get_text() {
+            if !text.is_empty() {
+                return Some(text.replace(['\r', '\n'], ""));
+            }
+        }
+    }
+    for (cmd, args) in TOOLS {
+        if let Ok(out) = std::process::Command::new(cmd).args(args).output() {
+            if out.status.success() && !out.stdout.is_empty() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                return Some(text.trim_end_matches(['\r', '\n']).replace(['\r', '\n'], ""));
+            }
+        }
+    }
+    None
+}
+
 fn ark_visuals() -> egui::Visuals {
     use egui::{Rounding, Stroke};
     let mut v = egui::Visuals::dark();
@@ -2143,7 +2172,14 @@ impl eframe::App for App {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label("Enter the archive password:");
-                let r = ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.password)
+                        .password(true)
+                        .id(egui::Id::new("password_field")),
+                );
+                if r.secondary_clicked() {
+                    self.pw_menu = ctx.pointer_interact_pos();
+                }
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     apply = true;
                 }
@@ -2160,8 +2196,33 @@ impl eframe::App for App {
                 });
             });
 
+            // Right-click menu. egui's built-in context_menu would open behind this dialog
+            // (its popups sit below Order::Tooltip), so draw our own on the topmost layer.
+            if let Some(pos) = self.pw_menu {
+                let mut close = false;
+                let menu = egui::Area::new(egui::Id::new("password_menu"))
+                    .order(egui::Order::Debug)
+                    .fixed_pos(pos)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            if ui.button("Paste").clicked() {
+                                match read_clipboard_text() {
+                                    Some(text) => self.password.push_str(&text),
+                                    None => self.status = "Could not read text from the clipboard.".into(),
+                                }
+                                ctx.memory_mut(|m| m.request_focus(egui::Id::new("password_field")));
+                                close = true;
+                            }
+                        });
+                    });
+                if close || (ctx.input(|i| i.pointer.any_pressed()) && !menu.response.contains_pointer()) {
+                    self.pw_menu = None;
+                }
+            }
+
             if apply {
                 self.show_password = false;
+                self.pw_menu = None;
                 if let Some(action) = self.pending_action.take() {
                     // password needed for an action, not for opening: resume it
                     self.resume_action(ctx, action);
@@ -2170,6 +2231,7 @@ impl eframe::App for App {
                 }
             } else if cancel || !open {
                 self.show_password = false;
+                self.pw_menu = None;
                 self.pw_retry = None;
                 if self.pending_action.take().is_some() {
                     self.status = "Cancelled.".into();
