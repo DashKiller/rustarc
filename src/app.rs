@@ -291,9 +291,13 @@ enum Msg {
 }
 
 /// An action that stopped at the password dialog and continues once a password is entered.
+#[derive(Clone)]
 enum PendingAction {
     /// Extract all (false) or the selection (true) – asks for the folder afterwards.
     Extract(bool),
+    /// Extract all (false) or the selection (true) into an already chosen folder.
+    ExtractTo(bool, PathBuf),
+    Test,
     /// "Open" (false) / "Open with…" (true) on the first selected file.
     Open(bool),
     Preview,
@@ -418,6 +422,8 @@ pub struct App {
     status_before_drag: String,
     /// status text that reports a wrong password; shown red for as long as it stays the status
     wrong_pw_status: Option<String>,
+    /// the action that is running, so it can be retried after a wrong password
+    last_action: Option<PendingAction>,
     /// drag-to-select: where the rubber band started (screen position)
     rubber: Option<Pos2>,
     /// selection that was there when the band started (kept when Ctrl is held)
@@ -480,6 +486,7 @@ impl App {
             drag_state: None,
             status_before_drag: String::new(),
             wrong_pw_status: None,
+            last_action: None,
             rubber: None,
             rubber_base: HashSet::new(),
             sort_key: 0,
@@ -576,16 +583,17 @@ impl App {
                 }
                 Msg::Done(res) => {
                     self.busy = false;
-                    self.status = match res {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let s = format!("Error: {e}");
-                            if !self.password.is_empty() && e.to_lowercase().contains("password") {
-                                self.wrong_pw_status = Some(s.clone());
-                            }
-                            s
-                        }
-                    };
+                    let wrong_pw = matches!(&res, Err(e)
+                        if !self.password.is_empty() && e.to_lowercase().contains("password"));
+                    if wrong_pw {
+                        self.wrong_password();
+                    } else {
+                        self.last_action = None;
+                        self.status = match res {
+                            Ok(s) => s,
+                            Err(e) => format!("Error: {e}"),
+                        };
+                    }
                     if let Some(p) = self.pending_open.take() {
                         self.open(ctx, p);
                     }
@@ -603,14 +611,31 @@ impl App {
                     self.busy = false;
                     match res {
                         Ok(text) => {
+                            self.last_action = None;
                             self.status = format!("Preview: {name}");
                             self.preview = Some((name, text));
                         }
-                        Err(e) => self.status = e,
+                        Err(e) => {
+                            if !self.password.is_empty() && e.to_lowercase().contains("password") {
+                                self.wrong_password();
+                            } else {
+                                self.last_action = None;
+                                self.status = e;
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// A password was entered but did not work: red status and the password dialog again;
+    /// OK then retries the action that just failed.
+    fn wrong_password(&mut self) {
+        self.status = "Wrong password.".into();
+        self.wrong_pw_status = Some(self.status.clone());
+        self.pending_action = self.last_action.take();
+        self.show_password = true;
     }
 
     // ── actions ──
@@ -663,6 +688,8 @@ impl App {
     fn resume_action(&mut self, ctx: &egui::Context, action: PendingAction) {
         match action {
             PendingAction::Extract(only_selected) => self.extract(ctx, only_selected),
+            PendingAction::ExtractTo(only_selected, dest) => self.extract_to(ctx, only_selected, dest),
+            PendingAction::Test => self.test(ctx),
             PendingAction::Open(ask) => self.open_external(ctx, ask),
             PendingAction::Preview => self.preview_selected(ctx),
             PendingAction::Nothing => {}
@@ -676,7 +703,9 @@ impl App {
     }
 
     fn extract(&mut self, ctx: &egui::Context, only_selected: bool) {
-        let Some(path) = self.path.clone() else { return };
+        if self.path.is_none() {
+            return;
+        }
         let check_sel = only_selected.then(|| self.selected.clone());
         if self.ask_password_first(check_sel.as_ref(), PendingAction::Extract(only_selected)) {
             return;
@@ -684,9 +713,15 @@ impl App {
         let Some(dest) = rfd::FileDialog::new().set_title("Extract to…").pick_folder() else {
             return;
         };
+        self.extract_to(ctx, only_selected, dest);
+    }
+
+    fn extract_to(&mut self, ctx: &egui::Context, only_selected: bool, dest: PathBuf) {
+        let Some(path) = self.path.clone() else { return };
         let sel: Option<HashSet<String>> = only_selected.then(|| self.selected.clone());
         let pw = self.password.clone();
         let ask = make_ask(self.tx.clone(), ctx.clone());
+        self.last_action = Some(PendingAction::ExtractTo(only_selected, dest.clone()));
         self.run(ctx, "Extracting…", move |p| {
             archive::extract_checked(&path, &dest, sel.as_ref(), &pw, p, &ask)
         });
@@ -695,6 +730,7 @@ impl App {
     fn test(&mut self, ctx: &egui::Context) {
         let Some(path) = self.path.clone() else { return };
         let pw = self.password.clone();
+        self.last_action = Some(PendingAction::Test);
         self.run(ctx, "Testing…", move |p| archive::test(&path, &pw, p));
     }
 
@@ -706,6 +742,7 @@ impl App {
             return;
         }
         let pw = self.password.clone();
+        self.last_action = Some(PendingAction::Open(ask));
         self.run(ctx, "Opening…", move |p| {
             let dest = temp_dir();
             let mut sel = HashSet::new();
@@ -734,6 +771,7 @@ impl App {
             return;
         }
         let pw = self.password.clone();
+        self.last_action = Some(PendingAction::Preview);
         self.busy = true;
         archive::progress_reset();
         self.status = "Preparing preview…".into();
@@ -855,6 +893,7 @@ impl App {
         }
         let pw = self.password.clone();
         let ask = make_ask(self.tx.clone(), ctx.clone());
+        self.last_action = Some(PendingAction::DragExtract(sel.iter().cloned().collect(), dest.clone()));
         self.run(ctx, "Extracting…", move |p| archive::extract_checked(&path, &dest, Some(&sel), &pw, p, &ask));
     }
 
